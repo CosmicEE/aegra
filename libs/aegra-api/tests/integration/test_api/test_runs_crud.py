@@ -320,6 +320,9 @@ class TestCancelRun:
         run = _run_row(status="running")
 
         class Session(DummySessionBase):
+            def expire_all(self) -> None:
+                pass
+
             async def scalar(self, _stmt):
                 return run
 
@@ -428,6 +431,29 @@ class TestCancelRuns:
 
         assert resp.status_code == 422
 
+    def test_cancel_runs_pending_selector_includes_parked_runs(self) -> None:
+        """A parked (internal queued) run is reported as pending, so cancelling pending runs
+        must include it — the SDK's cancel_many(status="pending") expects it gone."""
+        app = create_test_app(include_runs=True, include_threads=False)
+        seen: list[str] = []
+
+        class Session(DummySessionBase):
+            async def scalars(self, _stmt: Any = None) -> DummyScalarResult:
+                seen.append(str(_stmt.compile(compile_kwargs={"literal_binds": True})))
+                return DummyScalarResult([])
+
+        override_session_dependency(app, Session)
+        client = make_client(app)
+
+        assert client.post("/runs/cancel", json={"status": "pending"}).status_code == 204
+        assert client.post("/runs/cancel", json={"status": "all"}).status_code == 204
+        assert client.post("/runs/cancel", json={"status": "running"}).status_code == 204
+
+        pending_stmt, all_stmt, running_stmt = seen
+        assert "'queued'" in pending_stmt and "'pending'" in pending_stmt
+        assert "'queued'" in all_stmt and "'running'" in all_stmt
+        assert "'queued'" not in running_stmt
+
     def test_cancel_runs_no_matches_is_204(self) -> None:
         client = self._app_with_runs([])
 
@@ -499,6 +525,108 @@ class TestDeleteRun:
         resp = client.delete("/threads/test-thread-123/runs/test-run-123")
 
         assert resp.status_code == 204
+
+    def test_delete_run_queued_not_allowed(self):
+        """A queued run is active; deleting without force returns 409."""
+        app = create_test_app(include_runs=True, include_threads=False)
+
+        run = _run_row(status="queued")
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt):
+                return run
+
+        override_session_dependency(app, Session)
+        client = make_client(app)
+
+        resp = client.delete("/threads/test-thread-123/runs/test-run-123")
+
+        assert resp.status_code == 409
+        assert "active" in resp.json()["detail"].lower()
+
+    def test_delete_run_force_queued_drops_it_without_broker_cancel(self):
+        """Force-deleting a queued run drops it in place (no task to cancel) and promotes the queue."""
+        app = create_test_app(include_runs=True, include_threads=False)
+
+        run = _run_row(status="queued")
+        executed: list[str] = []
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt):
+                return run
+
+            async def execute(self, _stmt):
+                executed.append(str(_stmt))
+
+            async def commit(self):
+                pass
+
+        with (
+            patch("aegra_api.api.runs.streaming_service") as mock_streaming,
+            patch("aegra_api.api.runs.cancel_queued_run", new_callable=AsyncMock, return_value=True) as mock_drop,
+            patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock) as mock_reconcile,
+            patch("aegra_api.api.runs.dispatch_next_queued_run", new_callable=AsyncMock) as mock_dispatch,
+        ):
+            mock_streaming.cancel_run = AsyncMock()
+            mock_streaming.signal_run_cancelled = AsyncMock()
+            override_session_dependency(app, Session)
+            client = make_client(app)
+            resp = client.delete("/threads/test-thread-123/runs/test-run-123?force=1")
+
+        assert resp.status_code == 204
+        mock_drop.assert_awaited_once()
+        assert mock_drop.await_args.args[1:] == ("test-run-123", "test-thread-123")
+        mock_streaming.cancel_run.assert_not_awaited()  # queued run has no task to cancel
+        mock_reconcile.assert_not_awaited()
+        mock_streaming.signal_run_cancelled.assert_awaited_once_with("test-run-123")  # attached streams close
+        assert any("DELETE FROM runs" in stmt for stmt in executed)  # row actually removed
+        # Whatever was parked behind the deleted run may start now.
+        mock_dispatch.assert_awaited_with("test-thread-123")
+
+    def test_delete_run_force_queued_run_promoted_meanwhile_is_cancelled(self):
+        """Regression for the promotion race: the run read as queued was promoted (and may have
+        started) before the drop — it must be cancelled like an active run, never deleted
+        underneath a live task."""
+        app = create_test_app(include_runs=True, include_threads=False)
+
+        run = _run_row(status="queued")
+        executed: list[str] = []
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt):
+                return run
+
+            async def refresh(self, obj):
+                # The concurrent dispatcher promoted it; a live task is now attached.
+                obj.status = "running"
+
+            async def execute(self, _stmt):
+                executed.append(str(_stmt))
+
+            async def commit(self):
+                pass
+
+        with (
+            patch("aegra_api.api.runs.streaming_service") as mock_streaming,
+            patch("aegra_api.api.runs.cancel_queued_run", new_callable=AsyncMock, return_value=False),
+            patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=False),
+            patch("aegra_api.api.runs.set_thread_status_if_no_active_runs", new_callable=AsyncMock) as mock_reset,
+            patch("aegra_api.api.runs.dispatch_next_queued_run", new_callable=AsyncMock) as mock_dispatch,
+        ):
+            mock_streaming.cancel_run = AsyncMock()
+            override_session_dependency(app, Session)
+            client = make_client(app)
+            resp = client.delete("/threads/test-thread-123/runs/test-run-123?force=1")
+
+        assert resp.status_code == 204
+        # Fell through to the live-run path: the executing task is told to stop.
+        mock_streaming.cancel_run.assert_awaited_once_with("test-run-123")
+        assert any("DELETE FROM runs" in stmt for stmt in executed)
+        # It occupied the thread when deleted, so the thread is reset here (its own
+        # finalize can no longer find the row) and the queue behind it promoted.
+        mock_reset.assert_awaited_once()
+        assert mock_reset.await_args.args[1:] == (["test-thread-123"], "idle")
+        mock_dispatch.assert_awaited_once_with("test-thread-123")
 
 
 class TestJoinRun:

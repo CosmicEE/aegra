@@ -14,11 +14,23 @@ from aegra_api.services.run_status import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_queue_dispatch(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """finalize_run / interrupt_unowned_run / cancel_queued_run dispatch the thread's queued
+    runs afterwards; keep that off the database here."""
+    mock = AsyncMock()
+    monkeypatch.setattr("aegra_api.services.run_status.dispatch_next_queued_run", mock)
+    return mock
+
+
 def _make_mock_session() -> AsyncMock:
     """Create a mock async session with execute and commit."""
     session = AsyncMock()
     session.execute = AsyncMock()
     session.commit = AsyncMock()
+    # interrupt_unowned_run wraps its lock+CAS in a SAVEPOINT; `await session.begin_nested()`
+    # must hand back something whose commit()/rollback() are awaitable.
+    session.begin_nested = AsyncMock(return_value=AsyncMock())
     return session
 
 
@@ -274,6 +286,11 @@ class TestInterruptUnownedRun:
         assert interrupted is False
         mock_set_thread.assert_not_awaited()
         session.commit.assert_not_awaited()
+        # The thread row was locked first (gate lock order) inside a savepoint; a live owner
+        # means we wrote nothing, so the savepoint is rolled back to release the lock without
+        # expiring the caller's session — the owner's finalize needs that lock.
+        session.begin_nested.return_value.rollback.assert_awaited_once()
+        session.rollback.assert_not_awaited()
 
 
 class TestSafeSerialize:
