@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from redis import RedisError
 from sqlalchemy import delete, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette import EventSourceResponse
 
@@ -25,7 +26,15 @@ from aegra_api.models.enums import RunCancellationAction
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.run_preparation import _prepare_run
-from aegra_api.services.run_status import interrupt_unowned_run
+from aegra_api.services.run_status import (
+    ACTIVE_RUN_STATES,
+    QUEUED_RUN_STATE,
+    cancel_queued_run,
+    cancel_queued_run_by_id,
+    dispatch_next_queued_run,
+    interrupt_unowned_run,
+    set_thread_status_if_no_active_runs,
+)
 from aegra_api.services.run_waiters import TERMINAL_STATES, encode_output, heartbeat_wait_body, run_result_body
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.settings import settings
@@ -47,9 +56,29 @@ async def _request_run_interruption(
     run_orm: RunORM,
     action: RunCancellationAction,
 ) -> None:
-    """Interrupt a run without overwriting a terminal or live-owned run."""
+    """Interrupt a run without overwriting a terminal or live-owned run.
+
+    A run parked behind another (internal ``queued``) has no task or worker: it
+    is dropped in place and anything parked behind it is promoted. If it was
+    promoted between the caller's read and here, it is cancelled as the active
+    run it now is, so a promotion inside that window never executes unnoticed.
+    """
     if run_orm.status in TERMINAL_STATES:
         return
+
+    if run_orm.status == QUEUED_RUN_STATE:
+        if await cancel_queued_run(session, run_orm.run_id, run_orm.thread_id, user_id=run_orm.user_id):
+            # Nothing executes a queued run, but a client may be streaming it: close
+            # that stream. Best-effort — the cancellation itself is already committed.
+            try:
+                await streaming_service.signal_run_cancelled(run_orm.run_id)
+            except (RedisError, OSError):
+                logger.exception("Failed to signal queued run cancellation", run_id=run_orm.run_id)
+            return
+        # Promoted meanwhile: fall through and cancel it like any active run.
+        await session.refresh(run_orm)
+        if run_orm.status in TERMINAL_STATES:
+            return
 
     reconciled = await interrupt_unowned_run(
         session,
@@ -169,6 +198,14 @@ async def create_and_stream_run(
     cancel_on_disconnect = (request.on_disconnect or "cancel").lower() == "cancel"
 
     async def _cancel_on_client_close(_msg: MutableMapping[str, Any]) -> None:
+        # A double-texted run may still be parked (queued): it has no task for the
+        # broker to cancel, so drop it in the database. Kept independent of the
+        # broker step below so a failure in either one cannot skip the other.
+        try:
+            if await cancel_queued_run_by_id(run_id, thread_id, user_id=user.identity):
+                return
+        except SQLAlchemyError:
+            logger.exception("Failed to drop queued run on client disconnect", run_id=run_id)
         try:
             await broker_manager.request_cancel(run_id, "cancel")
         except (RedisError, OSError):
@@ -555,7 +592,11 @@ async def cancel_runs(
     """
     stmt = select(RunORM).where(RunORM.user_id == user.identity)
     if request.status is not None:
-        active = ["pending", "running"] if request.status == "all" else [request.status]
+        # Runs parked behind another (internal queued) are reported as pending, so a
+        # client cancelling its pending runs expects them included.
+        active = ["pending", QUEUED_RUN_STATE, "running"] if request.status == "all" else [request.status]
+        if request.status == "pending":
+            active.append(QUEUED_RUN_STATE)
         stmt = stmt.where(RunORM.status.in_(active))
     else:
         thread_exists = await session.scalar(
@@ -593,9 +634,9 @@ async def delete_run(
 ) -> None:
     """Delete a run record.
 
-    If the run is active (pending or running) and `force=0`, returns 409
-    Conflict. Set `force=1` to cancel the run first (best-effort) and then
-    delete it. Returns 204 No Content on success.
+    If the run is active (pending, running, or enqueued behind another run)
+    and `force=0`, returns 409 Conflict. Set `force=1` to cancel the run first
+    (best-effort) and then delete it. Returns 204 No Content on success.
     """
     # Deleting a run authorizes as a thread delete (Agent Protocol has no `runs`
     # resource); @auth.on.threads.delete covers it.
@@ -614,21 +655,27 @@ async def delete_run(
         raise HTTPException(404, f"Run '{run_id}' not found")
 
     # If active and not forcing, reject deletion
-    if run_orm.status in ["pending", "running"] and not force:
+    if run_orm.status in (*ACTIVE_RUN_STATES, QUEUED_RUN_STATE) and not force:
         raise HTTPException(
             status_code=409,
             detail="Run is active. Retry with force=1 to cancel and delete.",
         )
 
-    # If forcing and active, cancel first
-    if force and run_orm.status in ["pending", "running"]:
+    # If forcing and active, cancel first. A queued run is dropped in place (and the
+    # queue behind it promoted); a live one is asked to stop, and one promoted in the
+    # meantime is caught by the same path — see _request_run_interruption.
+    was_active = run_orm.status in (*ACTIVE_RUN_STATES, QUEUED_RUN_STATE)
+    occupied_thread = False
+    if force and was_active:
         logger.info(f"[delete_run] force-cancelling active run run_id={run_id}")
-        await streaming_service.cancel_run(run_id)
+        await _request_run_interruption(session, run_orm, "cancel")
         # Best-effort: wait for bg task to settle
         task = active_runs.get(run_id)
         if task:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        await session.refresh(run_orm)
+        occupied_thread = run_orm.status in ACTIVE_RUN_STATES
 
     # Delete the record
     await session.execute(
@@ -638,12 +685,21 @@ async def delete_run(
             RunORM.user_id == user.identity,
         )
     )
+    if occupied_thread:
+        # The row is gone, so the run's own finalize can no longer reset the thread:
+        # do it here, unless another run still occupies it. A queued run never held
+        # the thread, so deleting one leaves the thread status (incl. a HITL pause) alone.
+        await set_thread_status_if_no_active_runs(session, [thread_id], "idle", user_id=user.identity)
     await session.commit()
 
     # Clean up active task if exists
     task = active_runs.pop(run_id, None)
     if task and not task.done():
         task.cancel()
+
+    if was_active:
+        # Whatever was parked behind the deleted run may start now.
+        await dispatch_next_queued_run(thread_id)
 
     # 204 No Content
     return
