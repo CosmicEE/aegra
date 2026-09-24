@@ -114,7 +114,12 @@ the new run begins immediately.
   anything parked behind it is promoted at once. A run that was promoted in the
   meantime is cancelled like any other active run. Every path that frees a thread —
   a run's own finalize, a cancel, a force-delete — dispatches that thread's next
-  queued run, so a cancelled head never strands the queue.
+  queued run, so a cancelled head never strands the queue; it does so only once
+  nothing can still be executing the freed run (a live task's own exit is what
+  promotes the queue). A force-delete of a run owned by a worker waits, bounded, for
+  it to stop before the row is removed, and deleting a thread drops its parked runs
+  before cancelling the active one, so neither can start a successor on a thread
+  that is going away.
 - **Crash recovery.** Queued runs are durable in Postgres. In worker mode the
   lease reaper re-dispatches a thread whose queue was stranded by a lost wakeup;
   in dev mode (`LocalExecutor`) the same recovery runs on startup and via a periodic

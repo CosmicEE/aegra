@@ -247,7 +247,7 @@ class TestSetThreadStatusIfNoActiveRuns:
 
 class TestInterruptUnownedRun:
     @pytest.mark.asyncio
-    async def test_reconciles_run_and_thread_in_one_transaction(self) -> None:
+    async def test_reconciles_run_and_thread_in_one_transaction(self, _no_queue_dispatch: AsyncMock) -> None:
         session = _make_mock_session()
         result = MagicMock()
         result.scalar_one_or_none.return_value = "run-1"
@@ -269,6 +269,8 @@ class TestInterruptUnownedRun:
         assert "user-1" in compiled.params.values()
         mock_set_thread.assert_awaited_once_with(session, ["thread-1"], "idle", user_id="user-1")
         session.commit.assert_awaited_once()
+        # Whether the queue may move is the caller's call (a local task may still be running).
+        _no_queue_dispatch.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_does_not_commit_when_live_owner_wins_race(self) -> None:

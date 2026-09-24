@@ -473,10 +473,11 @@ class TestStrandedQueued:
     @pytest.mark.asyncio
     async def test_one_thread_failure_does_not_abort_batch(self) -> None:
         with patch("aegra_api.services.executor.executor") as ex:
-            ex.dispatch_next_for_thread = AsyncMock(side_effect=[RedisError("boom"), None])
-            await LeaseReaper._dispatch_stranded_queued(["t1", "t2"])
+            # Infra errors and a corrupt-row KeyError alike: the remaining threads still get their turn.
+            ex.dispatch_next_for_thread = AsyncMock(side_effect=[RedisError("boom"), KeyError("graph_id"), None])
+            await LeaseReaper._dispatch_stranded_queued(["t1", "t2", "t3"])
 
-        assert ex.dispatch_next_for_thread.await_count == 2  # second thread still attempted
+        assert ex.dispatch_next_for_thread.await_count == 3  # later threads still attempted
 
     @pytest.mark.asyncio
     async def test_reap_dispatches_stranded_queued(self) -> None:

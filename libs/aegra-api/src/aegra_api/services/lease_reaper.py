@@ -14,7 +14,6 @@ from datetime import UTC, datetime, timedelta
 import structlog
 from redis import RedisError
 from sqlalchemy import select, update
-from sqlalchemy.exc import SQLAlchemyError
 
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
@@ -130,7 +129,7 @@ class LeaseReaper:
         for thread_id in thread_ids:
             try:
                 await executor.dispatch_next_for_thread(thread_id)
-            except (RedisError, SQLAlchemyError):
+            except Exception:  # per-thread isolation: one bad row must not stall the rest of the cycle
                 logger.exception("Failed to dispatch stranded queued run", thread_id=thread_id)
 
     @staticmethod

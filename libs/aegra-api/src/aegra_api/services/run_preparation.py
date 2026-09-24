@@ -201,6 +201,10 @@ async def update_thread_metadata(
     # database, so a PATCH /threads/{id} racing this run cannot drop the keys
     # written here (or have its own dropped).
     thread = await session.scalar(select(ThreadORM).where(ThreadORM.thread_id == thread_id))
+    if thread is not None and user_id is not None and thread.user_id != user_id:
+        # The route checked ownership on an earlier snapshot; the thread may have been
+        # created by someone else since. Never merge metadata into a thread we do not own.
+        raise HTTPException(404, f"Thread '{thread_id}' not found")
 
     thread_name = _extract_thread_name(input_data or {})
 
