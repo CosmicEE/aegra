@@ -655,10 +655,10 @@ class TestDeleteRun:
         # Whatever was parked behind the deleted run may start now.
         mock_dispatch.assert_awaited_with("test-thread-123")
 
-    def test_delete_run_force_queued_run_promoted_meanwhile_is_cancelled(self):
-        """Regression for the promotion race: the run read as queued was promoted (and may have
-        started) before the drop — it must be cancelled like an active run, never deleted
-        underneath a live task."""
+    def test_delete_run_force_queued_run_promoted_meanwhile_is_cancelled_not_deleted(self):
+        """Regression for the promotion race: the run read as queued was promoted (and has
+        started) before the drop — it is cancelled like an active run and, while it is still
+        executing, neither deleted underneath the live task nor overtaken by the queue."""
         app = create_test_app(include_runs=True, include_threads=False)
 
         run = _run_row(status="queued")
@@ -685,7 +685,6 @@ class TestDeleteRun:
             patch("aegra_api.api.runs.streaming_service") as mock_streaming,
             patch("aegra_api.api.runs.cancel_queued_run", new_callable=AsyncMock, return_value=False),
             patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=False),
-            patch("aegra_api.api.runs.set_thread_status_if_no_active_runs", new_callable=AsyncMock) as mock_reset,
             patch("aegra_api.api.runs.dispatch_next_queued_run", new_callable=AsyncMock) as mock_dispatch,
             # the run never settles in this scenario; do not sit out the 10s wait window
             patch("aegra_api.api.runs._SETTLE_ATTEMPTS", 1),
@@ -696,15 +695,13 @@ class TestDeleteRun:
             client = make_client(app)
             resp = client.delete("/threads/test-thread-123/runs/test-run-123?force=1")
 
-        assert resp.status_code == 204
-        # Fell through to the live-run path: the executing task is told to stop.
+        # Fell through to the live-run path: the executing task is told to stop ...
         mock_streaming.cancel_run.assert_awaited_once_with("test-run-123")
-        assert any("DELETE FROM runs" in stmt for stmt in executed)
-        # It occupied the thread when deleted, so the thread is reset here (its own
-        # finalize can no longer find the row) and the queue behind it promoted.
-        mock_reset.assert_awaited_once()
-        assert mock_reset.await_args.args[1:] == (["test-thread-123"], "idle")
-        mock_dispatch.assert_awaited_once_with("test-thread-123")
+        # ... but it has not stopped within the window: the row stays, the queue stays parked.
+        assert resp.status_code == 409
+        assert "still executing" in resp.json()["detail"]
+        assert not any("DELETE FROM runs" in stmt for stmt in executed)
+        mock_dispatch.assert_not_awaited()
 
     def test_delete_run_force_waits_for_a_worker_owned_run_to_stop(self):
         """A run owned by a worker elsewhere stops asynchronously: the row is removed (and the
@@ -736,7 +733,6 @@ class TestDeleteRun:
         with (
             patch("aegra_api.api.runs.streaming_service") as mock_streaming,
             patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=False),
-            patch("aegra_api.api.runs.set_thread_status_if_no_active_runs", new_callable=AsyncMock) as mock_reset,
             patch("aegra_api.api.runs.dispatch_next_queued_run", new_callable=AsyncMock) as mock_dispatch,
             patch("aegra_api.api.runs.active_runs", {}),
             patch("aegra_api.api.runs._SETTLE_ATTEMPTS", 5),
@@ -750,8 +746,7 @@ class TestDeleteRun:
         assert resp.status_code == 204
         mock_streaming.cancel_run.assert_awaited_once_with("test-run-123")  # asked the worker to stop
         assert reads["n"] >= 3  # polled until the terminal write showed up
-        assert any("DELETE FROM runs" in stmt for stmt in executed)
-        mock_reset.assert_not_awaited()  # it had stopped: its own finalize reset the thread
+        assert any("DELETE FROM runs" in stmt for stmt in executed)  # only then is the row removed
         mock_dispatch.assert_awaited_once_with("test-thread-123")
 
 
