@@ -33,7 +33,6 @@ from aegra_api.services.run_status import (
     cancel_queued_run_by_id,
     dispatch_next_queued_run,
     interrupt_unowned_run,
-    set_thread_status_if_no_active_runs,
 )
 from aegra_api.services.run_waiters import TERMINAL_STATES, encode_output, heartbeat_wait_body, run_result_body
 from aegra_api.services.streaming_service import streaming_service
@@ -653,7 +652,9 @@ async def delete_run(
 
     If the run is active (pending, running, or enqueued behind another run)
     and `force=0`, returns 409 Conflict. Set `force=1` to cancel the run first
-    (best-effort) and then delete it. Returns 204 No Content on success.
+    and then delete it; a run owned by a worker that has not stopped within
+    ~10 seconds of the cancel is left in place with 409 so the client can retry.
+    Returns 204 No Content on success.
     """
     # Deleting a run authorizes as a thread delete (Agent Protocol has no `runs`
     # resource); @auth.on.threads.delete covers it.
@@ -682,7 +683,6 @@ async def delete_run(
     # queue behind it promoted); a live one is asked to stop, and one promoted in the
     # meantime is caught by the same path — see _request_run_interruption.
     was_active = run_orm.status in (*ACTIVE_RUN_STATES, QUEUED_RUN_STATE)
-    occupied_thread = False
     if force and was_active:
         logger.info(f"[delete_run] force-cancelling active run run_id={run_id}")
         await _request_run_interruption(session, run_orm, "cancel")
@@ -692,14 +692,18 @@ async def delete_run(
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         await session.refresh(run_orm)
-        if run_orm.status in ACTIVE_RUN_STATES:
-            # Owned by a worker elsewhere: it stops asynchronously. Wait (bounded) for its
-            # terminal write before removing the row — deleting first would let the queue
-            # behind it start while that worker may still be writing checkpoints. A worker
-            # that never answers is the lease reaper's problem, not this request's.
-            await _wait_for_run_to_settle(session, run_id)
-            await session.refresh(run_orm)
-        occupied_thread = run_orm.status in ACTIVE_RUN_STATES
+        if run_orm.status in ACTIVE_RUN_STATES and not await _wait_for_run_to_settle(session, run_id):
+            # Owned by a worker elsewhere and still executing after the bounded wait. Never
+            # delete a row a live worker owns, and never move the queue behind it: deleting
+            # first would start the successor while that worker may still be writing
+            # checkpoints. The cancel stays requested; the client retries once it has stopped.
+            raise HTTPException(
+                status_code=409,
+                detail="Run is still executing; cancellation was requested but has not completed. "
+                "Retry the delete once the run has stopped.",
+            )
+        # Terminal now (or never had a task): its own finalize / the reconciliation above has
+        # already reset the thread, so nothing is left to converge here but the row itself.
 
     # Delete the record
     await session.execute(
@@ -709,11 +713,6 @@ async def delete_run(
             RunORM.user_id == user.identity,
         )
     )
-    if occupied_thread:
-        # The row is gone, so the run's own finalize can no longer reset the thread:
-        # do it here, unless another run still occupies it. A queued run never held
-        # the thread, so deleting one leaves the thread status (incl. a HITL pause) alone.
-        await set_thread_status_if_no_active_runs(session, [thread_id], "idle", user_id=user.identity)
     await session.commit()
 
     # Clean up active task if exists

@@ -1988,7 +1988,7 @@
           "Thread Runs"
         ],
         "summary": "Delete Run",
-        "description": "Delete a run record.\n\nIf the run is active (pending, running, or enqueued behind another run)\nand `force=0`, returns 409 Conflict. Set `force=1` to cancel the run first\n(best-effort) and then delete it. Returns 204 No Content on success.",
+        "description": "Delete a run record.\n\nIf the run is active (pending, running, or enqueued behind another run)\nand `force=0`, returns 409 Conflict. Set `force=1` to cancel the run first\nand then delete it; a run owned by a worker that has not stopped within\n~10 seconds of the cancel is left in place with 409 so the client can retry.\nReturns 204 No Content on success.",
         "operationId": "delete_run_threads__thread_id__runs__run_id__delete",
         "parameters": [
           {
