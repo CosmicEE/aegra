@@ -145,6 +145,12 @@ async def interrupt_unowned_run(
     or claims the run concurrently cannot be overwritten by the API process.
     If a live worker merely missed its lease, the caller asks it to stop through
     the broker, and guarded finalization rejects any late worker write.
+
+    Does not dispatch the thread's queued runs: only the caller knows whether a
+    task may still be executing this run (a local task, or a worker whose lease
+    lapsed but is still alive). Promoting while one is would put two graphs on
+    the thread; the task's own exit (a finalize that loses the ownership CAS)
+    dispatches the queue in that case.
     """
     now = datetime.now(UTC)
     # Lock-then-CAS inside a SAVEPOINT. When the run turns out to be live-owned nothing is
@@ -186,8 +192,6 @@ async def interrupt_unowned_run(
     await set_thread_status_if_no_active_runs(session, [thread_id], "idle", user_id=user_id)
     await session.commit()
     logger.info("Interrupted unowned run", run_id=run_id, thread_id=thread_id)
-    # The thread is free now: start the next double-texted run parked behind it.
-    await dispatch_next_queued_run(thread_id)
     return True
 
 

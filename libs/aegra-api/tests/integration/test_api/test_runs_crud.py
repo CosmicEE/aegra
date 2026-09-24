@@ -3,6 +3,7 @@
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.fixtures.clients import create_test_app, make_client
@@ -73,6 +74,8 @@ def _run_row(
     # Add ORM-specific attributes
     run.metadata_json = metadata or {}
     run.error_message = None
+    run.claimed_by = None
+    run.lease_expires_at = None
     run.config = {}
     run.context = {}
 
@@ -99,6 +102,13 @@ def _run_row(
 
     run.__table__ = _T()
     return run
+
+
+@pytest.fixture(autouse=True)
+def mock_dispatch() -> Any:
+    """Cancel/delete paths may promote the thread's queued runs; keep that off the database."""
+    with patch("aegra_api.api.runs.dispatch_next_queued_run", new_callable=AsyncMock) as mock:
+        yield mock
 
 
 def _make_session_maker(session_instance: DummySessionBase) -> MagicMock:
@@ -353,6 +363,68 @@ class TestCancelRun:
             mock_streaming.signal_run_cancelled.assert_awaited_once_with("test-run-123")
 
 
+class TestCancelDispatchDecision:
+    """After reconciling an unowned run, the queue moves only when nothing can still execute it."""
+
+    @staticmethod
+    def _client_with(run: Any) -> TestClient:
+        app = create_test_app(include_runs=True, include_threads=False)
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: Any) -> Any:
+                return run
+
+            async def commit(self) -> None:
+                pass
+
+        override_session_dependency(app, Session)
+        return make_client(app)
+
+    def test_unclaimed_run_with_no_local_task_dispatches_immediately(self, mock_dispatch: AsyncMock) -> None:
+        # Worker mode, never claimed: no task anywhere can be executing it.
+        client = self._client_with(_run_row(status="pending"))
+        with (
+            patch("aegra_api.api.runs.streaming_service") as mock_streaming,
+            patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=True),
+            patch("aegra_api.api.runs.active_runs", {}),
+        ):
+            mock_streaming.cancel_run = AsyncMock()
+            mock_streaming.signal_run_cancelled = AsyncMock()
+            assert client.post("/threads/test-thread-123/runs/test-run-123/cancel").status_code == 200
+        mock_dispatch.assert_awaited_once_with("test-thread-123")
+
+    def test_local_task_defers_dispatch_to_its_exit(self, mock_dispatch: AsyncMock) -> None:
+        # Dev mode: claimed_by is always NULL, but the task is right here and still running —
+        # its finalize (losing the ownership CAS) is what promotes the queue, not this request.
+        client = self._client_with(_run_row(status="running"))
+        with (
+            patch("aegra_api.api.runs.streaming_service") as mock_streaming,
+            patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=True),
+            patch("aegra_api.api.runs.active_runs", {"test-run-123": MagicMock()}),
+        ):
+            mock_streaming.cancel_run = AsyncMock()
+            mock_streaming.signal_run_cancelled = AsyncMock()
+            assert client.post("/threads/test-thread-123/runs/test-run-123/cancel").status_code == 200
+        mock_streaming.cancel_run.assert_awaited_once_with("test-run-123", emit_end_event=False)
+        mock_dispatch.assert_not_awaited()
+
+    def test_claimed_run_defers_dispatch_to_the_worker(self, mock_dispatch: AsyncMock) -> None:
+        # Lease lapsed but the row was claimed: the worker may be slow rather than dead. Its
+        # finalize (or the stranded-queue sweep) promotes the queue once it has really stopped.
+        run = _run_row(status="running")
+        run.claimed_by = "worker-0"
+        client = self._client_with(run)
+        with (
+            patch("aegra_api.api.runs.streaming_service") as mock_streaming,
+            patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=True),
+            patch("aegra_api.api.runs.active_runs", {}),
+        ):
+            mock_streaming.cancel_run = AsyncMock()
+            mock_streaming.signal_run_cancelled = AsyncMock()
+            assert client.post("/threads/test-thread-123/runs/test-run-123/cancel").status_code == 200
+        mock_dispatch.assert_not_awaited()
+
+
 class TestCancelRuns:
     """Test POST /runs/cancel (bulk cancel used by the SDK's cancel_many)."""
 
@@ -596,6 +668,9 @@ class TestDeleteRun:
             async def scalar(self, _stmt):
                 return run
 
+            def expire_all(self) -> None:
+                pass
+
             async def refresh(self, obj):
                 # The concurrent dispatcher promoted it; a live task is now attached.
                 obj.status = "running"
@@ -612,6 +687,9 @@ class TestDeleteRun:
             patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=False),
             patch("aegra_api.api.runs.set_thread_status_if_no_active_runs", new_callable=AsyncMock) as mock_reset,
             patch("aegra_api.api.runs.dispatch_next_queued_run", new_callable=AsyncMock) as mock_dispatch,
+            # the run never settles in this scenario; do not sit out the 10s wait window
+            patch("aegra_api.api.runs._SETTLE_ATTEMPTS", 1),
+            patch("aegra_api.api.runs._SETTLE_INTERVAL_SECONDS", 0),
         ):
             mock_streaming.cancel_run = AsyncMock()
             override_session_dependency(app, Session)
@@ -626,6 +704,54 @@ class TestDeleteRun:
         # finalize can no longer find the row) and the queue behind it promoted.
         mock_reset.assert_awaited_once()
         assert mock_reset.await_args.args[1:] == (["test-thread-123"], "idle")
+        mock_dispatch.assert_awaited_once_with("test-thread-123")
+
+    def test_delete_run_force_waits_for_a_worker_owned_run_to_stop(self):
+        """A run owned by a worker elsewhere stops asynchronously: the row is removed (and the
+        queue behind it promoted) only after its terminal write lands, not while it may still
+        be writing checkpoints."""
+        app = create_test_app(include_runs=True, include_threads=False)
+
+        run = _run_row(status="running")
+        run.claimed_by = "worker-0"
+        executed: list[str] = []
+        reads = {"n": 0}
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt):
+                reads["n"] += 1
+                if reads["n"] >= 3:
+                    run.status = "interrupted"  # the worker's finalize landed on the 2nd poll
+                return run
+
+            def expire_all(self) -> None:
+                pass
+
+            async def execute(self, _stmt):
+                executed.append(str(_stmt))
+
+            async def commit(self):
+                pass
+
+        with (
+            patch("aegra_api.api.runs.streaming_service") as mock_streaming,
+            patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=False),
+            patch("aegra_api.api.runs.set_thread_status_if_no_active_runs", new_callable=AsyncMock) as mock_reset,
+            patch("aegra_api.api.runs.dispatch_next_queued_run", new_callable=AsyncMock) as mock_dispatch,
+            patch("aegra_api.api.runs.active_runs", {}),
+            patch("aegra_api.api.runs._SETTLE_ATTEMPTS", 5),
+            patch("aegra_api.api.runs._SETTLE_INTERVAL_SECONDS", 0),
+        ):
+            mock_streaming.cancel_run = AsyncMock()
+            override_session_dependency(app, Session)
+            client = make_client(app)
+            resp = client.delete("/threads/test-thread-123/runs/test-run-123?force=1")
+
+        assert resp.status_code == 204
+        mock_streaming.cancel_run.assert_awaited_once_with("test-run-123")  # asked the worker to stop
+        assert reads["n"] >= 3  # polled until the terminal write showed up
+        assert any("DELETE FROM runs" in stmt for stmt in executed)
+        mock_reset.assert_not_awaited()  # it had stopped: its own finalize reset the thread
         mock_dispatch.assert_awaited_once_with("test-thread-123")
 
 

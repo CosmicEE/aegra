@@ -19,7 +19,11 @@ from aegra_api.models.auth import User
 from aegra_api.services import run_preparation as run_preparation_mod
 from aegra_api.services.base_executor import BaseExecutor
 from aegra_api.services.run_executor import _resolve_rollback_base, _rollback_fork_base
-from aegra_api.services.run_preparation import _apply_multitask_strategy, _validate_resume_command
+from aegra_api.services.run_preparation import (
+    _apply_multitask_strategy,
+    _validate_resume_command,
+    update_thread_metadata,
+)
 from aegra_api.services.run_status import cancel_queued_run, finalize_run, interrupt_unowned_run, start_run
 from aegra_api.settings import settings
 
@@ -242,6 +246,31 @@ class TestApplyMultitaskStrategy:
         assert exc.value.status_code == 409
 
 
+class TestUpdateThreadMetadataOwnership:
+    """The route checks ownership on an earlier snapshot; the read that decides create-vs-merge re-checks it."""
+
+    @pytest.mark.asyncio
+    async def test_existing_thread_of_another_user_is_404(self) -> None:
+        # TOCTOU: the thread did not exist when the route looked, someone else created it since.
+        session = AsyncMock()
+        session.scalar = AsyncMock(return_value=MagicMock(user_id="someone-else"))
+
+        with pytest.raises(HTTPException) as exc:
+            await update_thread_metadata(session, "thread-1", "asst", "graph", user_id="me")
+
+        assert exc.value.status_code == 404
+        session.execute.assert_not_awaited()  # no metadata merged into a thread we do not own
+
+    @pytest.mark.asyncio
+    async def test_own_existing_thread_is_merged(self) -> None:
+        session = AsyncMock()
+        session.scalar = AsyncMock(return_value=MagicMock(user_id="me"))
+
+        await update_thread_metadata(session, "thread-1", "asst", "graph", user_id="me")
+
+        session.execute.assert_awaited_once()  # the jsonb merge UPDATE
+
+
 class _RecordingExecutor(BaseExecutor):
     """Concrete executor that records submitted jobs."""
 
@@ -293,6 +322,48 @@ class TestDispatchNextForThread:
             await ex.dispatch_next_for_thread("thread-1")
 
         assert ex.submitted == []
+
+    @pytest.mark.asyncio
+    async def test_noop_when_thread_deleted(self) -> None:
+        # The thread (and, by cascade, its runs) is gone: nothing to promote onto. Must stop
+        # at the thread read — a delete racing a finalize relies on this.
+        ex = _RecordingExecutor()
+        session = AsyncMock()
+        session.scalar = AsyncMock(side_effect=[None])
+
+        with patch("aegra_api.services.base_executor._get_session_maker", return_value=_make_session_maker(session)):
+            await ex.dispatch_next_for_thread("thread-1")
+
+        assert ex.submitted == []
+        assert session.scalar.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_corrupt_queued_row_is_failed_and_the_next_one_promoted(self) -> None:
+        # A row whose execution_params cannot be rebuilt (KeyError, not just ValueError) is
+        # marked error and the run parked behind it is promoted in the same dispatch.
+        ex = _RecordingExecutor()
+        corrupt = _fake_run(run_id="bad", status="queued")
+        good = _fake_run(run_id="good", status="queued")
+        session = AsyncMock()
+        session.execute = AsyncMock()
+        session.commit = AsyncMock()
+        # attempt 1: thread, no occupying run, corrupt row; attempt 2: thread, no occupying, good row
+        session.scalar = AsyncMock(
+            side_effect=[MagicMock(status="busy"), None, corrupt, MagicMock(status="busy"), None, good]
+        )
+
+        fake_job = MagicMock()
+        fake_job.identity.run_id = "good"
+        with (
+            patch("aegra_api.services.base_executor._get_session_maker", return_value=_make_session_maker(session)),
+            patch("aegra_api.services.base_executor.RunJob.from_run_orm", side_effect=[KeyError("graph_id"), fake_job]),
+        ):
+            await ex.dispatch_next_for_thread("thread-1")
+
+        assert corrupt.status == "error"
+        assert "graph_id" in corrupt.error_message
+        assert good.status == "pending"
+        assert ex.submitted == [fake_job]
 
     @pytest.mark.asyncio
     async def test_noop_when_thread_occupied(self) -> None:
@@ -816,15 +887,18 @@ class TestCancelQueuedRun:
 
 class TestInterruptUnownedRunDispatch:
     @pytest.mark.asyncio
-    async def test_reconciled_cancel_locks_thread_first_and_dispatches(self) -> None:
-        # Same lock order as the admission gate (thread, then run), and the freed thread's
-        # next queued run is started right away.
+    async def test_reconciled_cancel_locks_thread_first_and_leaves_dispatch_to_caller(self) -> None:
+        # Same lock order as the admission gate (thread, then run). It does NOT promote the
+        # queue itself: in dev mode claimed_by is always NULL, so this reconciles runs whose
+        # local task is still executing — only the caller can tell, and a live task's exit is
+        # what dispatches. Promoting here would put two graphs on the thread.
         session, captured = _capturing_session(returning="run-1")
         with patch("aegra_api.services.run_status.dispatch_next_queued_run", new_callable=AsyncMock) as dispatched:
             assert await interrupt_unowned_run(session, "run-1", "thread-1", user_id="u") is True
 
         assert captured[0].startswith("SELECT thread") and "FOR UPDATE" in captured[0]
-        dispatched.assert_awaited_once_with("thread-1")
+        session.commit.assert_awaited_once()
+        dispatched.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_live_owned_run_releases_the_thread_lock(self) -> None:

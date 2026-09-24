@@ -7,6 +7,7 @@ one interface, two backends (local asyncio tasks vs Redis workers).
 import asyncio
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 from sqlalchemy import select, update
@@ -20,6 +21,8 @@ from aegra_api.settings import settings
 logger = structlog.getLogger(__name__)
 
 _OCCUPYING_RUN_STATUSES = ("running", "pending")
+# Sentinel: a promotion attempt failed a corrupt row and the caller should try the next one.
+_RETRY = object()
 
 
 class BaseExecutor(ABC):
@@ -89,18 +92,29 @@ class BaseExecutor(ABC):
 
     async def _dispatch_next_for_thread(self, thread_id: str) -> None:
         maker = _get_session_maker()
+        while True:
+            job = await self._promote_oldest_queued(maker, thread_id)
+            if job is None:
+                return
+            if job is _RETRY:
+                continue  # a corrupt row was failed; the thread is still free, try the next one
+            logger.info("Dispatched queued run", run_id=job.identity.run_id, thread_id=thread_id)
+            await self.submit(job)
+            return
+
+    async def _promote_oldest_queued(self, maker: Any, thread_id: str) -> RunJob | object | None:
+        """One promotion attempt: the promoted RunJob, ``_RETRY`` after failing a corrupt row, else None."""
         async with maker() as session:
             thread = await session.scalar(select(ThreadORM).where(ThreadORM.thread_id == thread_id).with_for_update())
-            if (
-                thread is not None
-                and thread.status == "interrupted"
-                and settings.multitask.MULTITASK_PAUSED_THREAD_POLICY == "reject"
-            ):
+            if thread is None:
+                # Deleted underneath us (its runs cascade with it): nothing to promote onto.
+                return None
+            if thread.status == "interrupted" and settings.multitask.MULTITASK_PAUSED_THREAD_POLICY == "reject":
                 # Thread is paused on a human-in-the-loop interrupt(). Promoting a queued
                 # fresh-input run would run it against the paused checkpoint and consume the
                 # pending interrupt — the admission 409 guard only covers run creation, so the
                 # guard must also hold here. Leave queued runs parked until a resume clears it.
-                return
+                return None
             occupying = await session.scalar(
                 select(RunORM.run_id)
                 .where(RunORM.thread_id == thread_id, RunORM.status.in_(_OCCUPYING_RUN_STATUSES))
@@ -114,7 +128,7 @@ class BaseExecutor(ABC):
                     .values(status="busy", updated_at=datetime.now(UTC))
                 )
                 await session.commit()
-                return
+                return None
 
             run_orm = await session.scalar(
                 select(RunORM)
@@ -124,19 +138,20 @@ class BaseExecutor(ABC):
                 .with_for_update(skip_locked=True)
             )
             if run_orm is None:
-                return
+                return None
 
             try:
                 job = RunJob.from_run_orm(run_orm)
-            except ValueError as exc:
-                # Corrupt/legacy row with no execution_params: it can never run, so fail it
-                # instead of letting every recovery sweep trip over it and stall the queue.
+            except (ValueError, KeyError, TypeError) as exc:
+                # Corrupt/legacy row (missing or malformed execution_params): it can never run,
+                # so fail it instead of letting every recovery sweep trip over it, and let the
+                # caller try the run parked behind it right away.
                 run_orm.status = "error"
-                run_orm.error_message = str(exc)
+                run_orm.error_message = f"Queued run cannot be dispatched: {exc!r}"
                 run_orm.updated_at = datetime.now(UTC)
                 await session.commit()
-                logger.error("Queued run cannot be dispatched, marked error", run_id=run_orm.run_id, error=str(exc))
-                return
+                logger.error("Queued run cannot be dispatched, marked error", run_id=run_orm.run_id, error=repr(exc))
+                return _RETRY
 
             run_orm.status = "pending"
             # Stamp updated_at so the stuck-pending reaper measures time since promotion,
@@ -148,6 +163,4 @@ class BaseExecutor(ABC):
                 .values(status="busy", updated_at=datetime.now(UTC))
             )
             await session.commit()
-
-        logger.info("Dispatched queued run", run_id=job.identity.run_id, thread_id=thread_id)
-        await self.submit(job)
+        return job

@@ -50,6 +50,21 @@ logger = structlog.getLogger(__name__)
 # Default stream modes for background run execution
 DEFAULT_STREAM_MODES = ["values"]
 
+# cancel?wait=1 and force-delete poll for the run to reach a terminal state: 20 x 0.5s.
+_SETTLE_ATTEMPTS = 20
+_SETTLE_INTERVAL_SECONDS = 0.5
+
+
+async def _wait_for_run_to_settle(session: AsyncSession, run_id: str) -> bool:
+    """Poll the database until the run is terminal (or gone). False when the window expired."""
+    for _ in range(_SETTLE_ATTEMPTS):
+        await asyncio.sleep(_SETTLE_INTERVAL_SECONDS)
+        session.expire_all()  # sync method, clears cache
+        fresh = await session.scalar(select(RunORM).where(RunORM.run_id == run_id))
+        if fresh is None or fresh.status in TERMINAL_STATES:
+            return True
+    return False
+
 
 async def _request_run_interruption(
     session: AsyncSession,
@@ -80,6 +95,7 @@ async def _request_run_interruption(
         if run_orm.status in TERMINAL_STATES:
             return
 
+    claimed_by = run_orm.claimed_by
     reconciled = await interrupt_unowned_run(
         session,
         run_orm.run_id,
@@ -100,6 +116,13 @@ async def _request_run_interruption(
             # Database reconciliation has already committed. A broker outage
             # must not turn the successful interruption into an API error.
             logger.exception("Failed to signal reconciled run interruption", run_id=run_orm.run_id)
+        # Promote the queue only when nothing can still be executing this run: no task in
+        # this process (dev mode never sets claimed_by, so the row alone cannot tell) and
+        # no worker claim. Otherwise the stop just requested lands on a live task, and that
+        # task's exit — its finalize losing the ownership CAS — is what dispatches the
+        # queue; promoting here would put two graphs on the thread until it stops.
+        if active_runs.get(run_orm.run_id) is None and claimed_by is None:
+            await dispatch_next_queued_run(run_orm.thread_id)
         return
 
     await session.refresh(run_orm)
@@ -561,15 +584,9 @@ async def cancel_run_endpoint(
     logger.info(f"[cancel_run] request {action} run_id={run_id} user={user.identity} thread_id={thread_id}")
     await _request_run_interruption(session, run_orm, action)
 
-    # Optionally wait for the run to settle
+    # Optionally wait for the run to settle (bounded, ~10s)
     if wait:
-        # Poll DB until the run reaches a terminal state (or 10s timeout).
-        for _ in range(20):
-            await asyncio.sleep(0.5)
-            session.expire_all()  # sync method, clears cache
-            fresh = await session.scalar(select(RunORM).where(RunORM.run_id == run_id))
-            if fresh and fresh.status in TERMINAL_STATES:
-                break
+        await _wait_for_run_to_settle(session, run_id)
 
     await session.refresh(run_orm)
     return Run.model_validate(run_orm)
@@ -675,6 +692,13 @@ async def delete_run(
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         await session.refresh(run_orm)
+        if run_orm.status in ACTIVE_RUN_STATES:
+            # Owned by a worker elsewhere: it stops asynchronously. Wait (bounded) for its
+            # terminal write before removing the row — deleting first would let the queue
+            # behind it start while that worker may still be writing checkpoints. A worker
+            # that never answers is the lease reaper's problem, not this request's.
+            await _wait_for_run_to_settle(session, run_id)
+            await session.refresh(run_orm)
         occupied_thread = run_orm.status in ACTIVE_RUN_STATES
 
     # Delete the record
