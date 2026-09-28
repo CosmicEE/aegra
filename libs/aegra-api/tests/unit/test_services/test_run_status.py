@@ -288,9 +288,8 @@ class TestInterruptUnownedRun:
         assert interrupted is False
         mock_set_thread.assert_not_awaited()
         session.commit.assert_not_awaited()
-        # The thread row was locked first (gate lock order) inside a savepoint; a live owner
-        # means we wrote nothing, so the savepoint is rolled back to release the lock without
-        # expiring the caller's session — the owner's finalize needs that lock.
+        # Thread row locked first (gate lock order) inside a savepoint; a live owner means nothing
+        # was written, so the savepoint rolls back to free the lock without expiring the session.
         session.begin_nested.return_value.rollback.assert_awaited_once()
         session.rollback.assert_not_awaited()
 

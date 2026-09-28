@@ -56,10 +56,8 @@ async def execute_run(job: RunJob) -> None:
 
     try:
         if not await start_run(run_id, user_id=user_id):
-            # Terminal before it started: a user cancelled it, or a multitask gate
-            # pre-empted it between dispatch and start. Whoever did owns its status and
-            # the thread. Release any attached stream, and let the thread move on to a
-            # replacement parked behind this run.
+            # Terminal before start (user cancel or multitask pre-emption): whoever did it owns
+            # the status and thread. Release the stream and let a parked replacement start.
             logger.info("Run became terminal before execution started", run_id=run_id)
             await _best_effort_signal(streaming_service.signal_run_cancelled, run_id)
             await dispatch_next_queued_run(thread_id)
@@ -90,9 +88,8 @@ async def execute_run(job: RunJob) -> None:
         if run_id in _lease_loss_cancellations:
             resumes_elsewhere = True
             logger.info("Lease-loss cancel, skipping finalize", run_id=run_id)
-            # A multitask gate pre-emption also clears the lease: if a replacement is
-            # parked behind this run, this is the moment it may start. A no-op when the
-            # reaper re-enqueued this run instead (that pending run occupies the thread).
+            # A gate pre-emption also clears the lease, so a replacement parked behind this run
+            # may start now; a no-op when the reaper re-enqueued this run instead.
             await dispatch_next_queued_run(thread_id)
         elif run_id in _shutdown_cancellations:
             # Drain cancel: the run goes back to the queue, so finalizing here
@@ -202,9 +199,8 @@ async def _stream_graph(job: RunJob) -> _GraphResult:
         ) as graph,
         with_auth_ctx(job.user, job.user.permissions),  # type: ignore[arg-type]
     ):
-        # Deep rollback: fork this run from the checkpoint that preceded the
-        # target run, so the target's writes (and any orphaned tool calls) are
-        # reverted and the graph re-enters via __start__. No checkpoints deleted.
+        # Fork from the checkpoint preceding the target run so its writes are reverted and the
+        # graph re-enters via __start__; no checkpoints are deleted.
         if job.execution.rollback_target_run_id and not run_config.get("configurable", {}).get("checkpoint_id"):
             base = await _rollback_fork_base(graph, job)
             if base is not None:
@@ -306,12 +302,8 @@ def _build_run_config(job: RunJob) -> dict[str, Any]:
 
 
 async def _rollback_fork_base(graph: Any, job: RunJob) -> str | None:
-    """Checkpoint this rollback run forks from, or None to run without reverting.
-
-    Re-reads the target's CURRENT status so a run that raced to ``success`` after the
-    admission gate marked it interrupted is never reverted (its finalize may commit
-    success after the gate's decision). Otherwise resolves the pre-target base.
-    """
+    """Checkpoint this rollback run forks from, or None to run without reverting. Re-reads the
+    target's status so a run that raced to ``success`` past the gate is never reverted."""
     target_run_id = job.execution.rollback_target_run_id
     if target_run_id is None:
         return None
@@ -326,17 +318,8 @@ async def _rollback_fork_base(graph: Any, job: RunJob) -> str | None:
 
 
 async def _resolve_rollback_base(graph: Any, thread_id: str, user: User, target_run_id: str) -> str | None:
-    """Find the checkpoint preceding ``target_run_id`` to fork the rollback from.
-
-    Resolved by LINEAGE: the target run's OLDEST checkpoint's ``parent_config`` points
-    at the clean pre-target state. aegra stamps every checkpoint's metadata with its
-    creating run_id; we scan the whole (bounded) history newest->oldest and keep the
-    OLDEST checkpoint whose run_id is the target. Scanning fully — rather than stopping
-    at the first non-target row — makes the result independent of checkpoint ORDER, so
-    a sibling branch from an earlier rollback, the current run's own partial, or a
-    straggler the cancelled target writes after the fork cannot mis-anchor it. Returns
-    None when the target was the thread's first run (no parent to fork).
-    """
+    """Fork base = ``parent_config`` of the target run's OLDEST checkpoint (run_id is stamped in
+    metadata). The whole window is scanned so sibling branches or stragglers cannot mis-anchor it."""
     history_config = create_thread_config(thread_id, user)
     history_config.setdefault("configurable", {})["checkpoint_ns"] = ""
     oldest_target = None
@@ -349,10 +332,8 @@ async def _resolve_rollback_base(graph: Any, thread_id: str, user: User, target_
     if oldest_target is None:
         return None
     if seen >= _ROLLBACK_HISTORY_LIMIT and oldest_target.parent_config is not None:
-        # The capped window cannot prove the target's lineage is complete — interleaved
-        # sibling rows can end the window while older target checkpoints lie beyond it,
-        # so forking from the oldest IN-WINDOW match could land mid-run. Fail loud. (A
-        # parent-less oldest is provably the root → fall through to return None / fork fresh.)
+        # A full window cannot prove the lineage is complete (older target rows may lie beyond
+        # it), and forking mid-run would silently corrupt state: fail loud instead.
         raise RuntimeError(
             f"rollback base unresolved: run {target_run_id} history exceeds {_ROLLBACK_HISTORY_LIMIT} checkpoints"
         )

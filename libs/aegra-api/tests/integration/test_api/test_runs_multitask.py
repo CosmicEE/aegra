@@ -1,8 +1,6 @@
 """Integration tests for the multitask_strategy field at the HTTP boundary.
 
-Stateful behaviors (409 reject, queue ordering, interrupt/rollback) are
-covered by the e2e suite against a real database; here we assert the
-request-validation contract the tightened enum now enforces.
+Stateful behaviours live in the e2e suite; this asserts the request-validation contract.
 """
 
 from unittest.mock import AsyncMock, MagicMock
@@ -34,9 +32,8 @@ class TestMultitaskValidation:
 
     @pytest.mark.parametrize("strategy", ["reject", "interrupt", "rollback", "enqueue"])
     def test_valid_strategy_passes_validation(self, strategy: str) -> None:
-        # A valid enum value must be accepted at validation — reaching the SAME outcome
-        # as omitting the field (never 422). Fresh clients keep the two posts independent.
-        # (Over-loosening is pinned by test_invalid_strategy_returns_422 above.)
+        # A valid enum value must reach the same outcome as omitting the field (never 422);
+        # fresh clients keep the two posts independent.
         body = {"assistant_id": "asst-123", "input": {"messages": []}}
         baseline = _client().post("/threads/test-thread-123/runs", json=body)
         resp = _client().post("/threads/test-thread-123/runs", json={**body, "multitask_strategy": strategy})

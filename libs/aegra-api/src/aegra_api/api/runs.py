@@ -56,11 +56,7 @@ _SETTLE_INTERVAL_SECONDS = 0.5
 
 
 async def _reread_run(session: AsyncSession, run_id: str, thread_id: str, user_id: str) -> RunORM | None:
-    """Re-read the run, returning None when it is gone.
-
-    ``session.refresh()`` raises ``ObjectDeletedError`` on a row another request deleted
-    meanwhile, turning a concurrent delete into a 500; a plain re-query reports it instead.
-    """
+    """Re-query rather than ``refresh()``: a row deleted meanwhile must read as None, not 500."""
     session.expire_all()  # sync method, clears cache
     return await session.scalar(
         select(RunORM).where(
@@ -87,13 +83,8 @@ async def _request_run_interruption(
     run_orm: RunORM,
     action: RunCancellationAction,
 ) -> None:
-    """Interrupt a run without overwriting a terminal or live-owned run.
-
-    A run parked behind another (internal ``queued``) has no task or worker: it
-    is dropped in place and anything parked behind it is promoted. If it was
-    promoted between the caller's read and here, it is cancelled as the active
-    run it now is, so a promotion inside that window never executes unnoticed.
-    """
+    """Interrupt a run without overwriting a terminal or live-owned one: a parked (``queued``) run
+    is dropped in place, and one promoted since the caller's read is cancelled as the active run."""
     if run_orm.status in TERMINAL_STATES:
         return
 
@@ -132,11 +123,8 @@ async def _request_run_interruption(
             # Database reconciliation has already committed. A broker outage
             # must not turn the successful interruption into an API error.
             logger.exception("Failed to signal reconciled run interruption", run_id=run_orm.run_id)
-        # Promote the queue only when nothing can still be executing this run: no task in
-        # this process (dev mode never sets claimed_by, so the row alone cannot tell) and
-        # no worker claim. Otherwise the stop just requested lands on a live task, and that
-        # task's exit — its finalize losing the ownership CAS — is what dispatches the
-        # queue; promoting here would put two graphs on the thread until it stops.
+        # Promote only when no local task or worker can still be executing this run; otherwise
+        # its exit (a finalize losing the CAS) dispatches, and promoting here would run two graphs.
         if active_runs.get(run_orm.run_id) is None and claimed_by is None:
             await dispatch_next_queued_run(run_orm.thread_id)
         return
@@ -237,9 +225,8 @@ async def create_and_stream_run(
     cancel_on_disconnect = (request.on_disconnect or "cancel").lower() == "cancel"
 
     async def _cancel_on_client_close(_msg: MutableMapping[str, Any]) -> None:
-        # A double-texted run may still be parked (queued): it has no task for the
-        # broker to cancel, so drop it in the database. Kept independent of the
-        # broker step below so a failure in either one cannot skip the other.
+        # A parked (queued) run has no task for the broker to cancel, so drop it in the database;
+        # kept separate from the broker step so a failure in one cannot skip the other.
         try:
             # sse-starlette's anyio cancel punches through asyncio.shield (#530): shield the
             # checkout so a disconnect mid-query cannot leak the pooled connection.
@@ -675,10 +662,9 @@ async def delete_run(
 ) -> None:
     """Delete a run record.
 
-    If the run is active (pending, running, or enqueued behind another run)
-    and `force=0`, returns 409 Conflict. Set `force=1` to cancel the run first
-    and then delete it; a run owned by a worker that has not stopped within
-    ~10 seconds of the cancel is left in place with 409 so the client can retry.
+    If the run is active (pending, running or enqueued) and `force=0`, returns 409
+    Conflict. Set `force=1` to cancel the run first and then delete it; a worker-owned
+    run that has not stopped within ~10 seconds is left in place with 409 for a retry.
     Returns 204 No Content on success.
     """
     # Deleting a run authorizes as a thread delete (Agent Protocol has no `runs`
@@ -704,9 +690,8 @@ async def delete_run(
             detail="Run is active. Retry with force=1 to cancel and delete.",
         )
 
-    # If forcing and active, cancel first. A queued run is dropped in place (and the
-    # queue behind it promoted); a live one is asked to stop, and one promoted in the
-    # meantime is caught by the same path — see _request_run_interruption.
+    # Force: cancel first. A queued run is dropped in place, a live one is asked to stop
+    # (see _request_run_interruption).
     was_active = run_orm.status in (*ACTIVE_RUN_STATES, QUEUED_RUN_STATE)
     if force and was_active:
         logger.info(f"[delete_run] force-cancelling active run run_id={run_id}")
@@ -724,10 +709,8 @@ async def delete_run(
             and fresh.status in ACTIVE_RUN_STATES
             and not await _wait_for_run_to_settle(session, run_id)
         ):
-            # Owned by a worker elsewhere and still executing after the bounded wait. Never
-            # delete a row a live worker owns, and never move the queue behind it: deleting
-            # first would start the successor while that worker may still be writing
-            # checkpoints. The cancel stays requested; the client retries once it has stopped.
+            # Still executing on a worker after the bounded wait: never delete a row a live worker
+            # owns or promote behind it while it may still write checkpoints. The client retries.
             raise HTTPException(
                 status_code=409,
                 detail="Run is still executing; cancellation was requested but has not completed. "

@@ -1,10 +1,6 @@
 """E2E tests for double-texting (multitask) strategies against a real server.
 
-Uses the LLM-free ``stress_test`` graph so concurrency/serialization can be
-exercised deterministically without API tokens. Run with a live server:
-
-    make e2e-dev    # LocalExecutor
-    make e2e-prod   # Redis workers
+Uses the LLM-free ``stress_test`` graph, so no API tokens are needed (make e2e-dev / e2e-prod).
 """
 
 import asyncio
@@ -285,11 +281,8 @@ async def test_rollback_reverts_active_run_e2e() -> None:
 @pytest.mark.e2e
 @pytest.mark.asyncio
 async def test_two_sequential_rollbacks_do_not_resurrect_e2e() -> None:
-    """A second rollback must anchor by lineage, not resurrect the first-rolled-back run.
-
-    GEN1/GEN2 are errored (non-success) so each idle rollback engages: GEN2 reverts GEN1
-    and GEN3 must fork from PRIOR (GEN2's lineage parent), not GEN1's abandoned sibling.
-    """
+    """A second rollback must anchor by lineage: GEN2 reverts errored GEN1, and GEN3 must fork
+    from PRIOR (GEN2's lineage parent), not from GEN1's abandoned sibling."""
     async with httpx.AsyncClient(base_url=_base_url(), timeout=60) as client:
         aid, tid = await _setup(client)
         p = await client.post(f"/threads/{tid}/runs", json=_marker_body(aid, "PRIOR"))

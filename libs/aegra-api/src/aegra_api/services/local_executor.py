@@ -60,12 +60,8 @@ class LocalExecutor(BaseExecutor):
         )
 
     async def wait_for_completion(self, run_id: str, *, timeout: float = 300.0) -> None:
-        """Raises TimeoutError past *timeout*, so callers can tell a slow run from a finished one.
-
-        A double-texted run may still be ``queued`` (no task yet): poll until it is
-        dispatched (a task appears) or reaches a terminal state, so join/wait don't
-        return an empty result for a run that simply hasn't started.
-        """
+        """Raises TimeoutError past *timeout*. Polls while the run is still ``queued`` (no task yet)
+        so join/wait do not return an empty result for a parked run."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         poll_count = 0
@@ -93,11 +89,8 @@ class LocalExecutor(BaseExecutor):
         self._sweep_task = asyncio.create_task(self._stranded_queue_loop())
 
     async def _stranded_queue_loop(self) -> None:
-        """Periodically dispatch threads stranded with a queued run but nothing running.
-
-        Mirrors the prod lease reaper: in dev a swallowed finalize-time dispatch failure
-        would otherwise wedge a queued run until the next restart.
-        """
+        """Dev-mode stand-in for the lease reaper's stranded-queue scan: a swallowed finalize-time
+        dispatch failure would otherwise wedge a queued run until restart."""
         while self._accepting:
             try:
                 await asyncio.sleep(_STRANDED_SWEEP_INTERVAL_SECONDS)
@@ -130,13 +123,8 @@ class LocalExecutor(BaseExecutor):
                 logger.exception("Stranded-queue dispatch failed", thread_id=thread_id)
 
     async def _recover_orphaned_queue(self) -> None:
-        """Recover threads with in-flight or queued runs after a restart.
-
-        A fresh dev process has no live tasks, so any running/pending run is an
-        orphan from the dead process. For each affected thread, fail the orphaned
-        run (so the thread isn't wedged forever, esp. under reject) and dispatch
-        the next queued run, if any.
-        """
+        """Fail runs orphaned by the previous process (a fresh process has no live tasks) and
+        dispatch the next queued run on each affected thread."""
         maker = _get_session_maker()
         async with maker() as session:
             threads = {
@@ -167,9 +155,8 @@ class LocalExecutor(BaseExecutor):
                         ),
                     )
                     if result.rowcount > 0:
-                        # The orphans' finalizes never ran: reset the thread the way an error
-                        # finalize would have, so it is not left 'busy' with no active run.
-                        # Queued-only threads match nothing here, preserving a HITL pause.
+                        # The orphans' finalizes never ran: reset the thread as an error finalize
+                        # would. Queued-only threads match nothing here, preserving a HITL pause.
                         await session.execute(
                             update(ThreadORM)
                             .where(ThreadORM.thread_id == thread_id)

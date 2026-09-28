@@ -3,8 +3,7 @@
 Periodically scans the runs table for rows where
 ``status='running' AND lease_expires_at < now()``. It atomically either
 returns them to ``pending`` or marks their retry budget exhausted, then
-re-enqueues only retryable run IDs. It also restarts threads whose queued
-(double-texted) runs lost their dispatch wakeup.
+re-enqueues only retryable run IDs, and re-dispatches stranded queued runs.
 """
 
 import asyncio
@@ -81,9 +80,8 @@ class LeaseReaper:
                 pushed = await self._reenqueue(lost)
                 REAPER_RECOVERED_RUNS.labels(outcome="stuck_pending").inc(len(pushed))
 
-        # Stranded queued: a prior run's dispatch wakeup was lost (process died, or its
-        # head run was just permanently failed above). Detected AFTER the crashed/stuck
-        # handling so a freshly-failed head's successor is caught this cycle, not the next.
+        # Stranded queued (dispatch wakeup lost): scanned AFTER the crashed/stuck handling so a
+        # head run failed just above gets its successor promoted this cycle, not the next.
         stranded_queued = await self._find_stranded_queued_threads()
         if stranded_queued:
             logger.warning("Dispatching stranded queued runs", thread_count=len(stranded_queued))

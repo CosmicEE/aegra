@@ -1,8 +1,6 @@
 """Unit tests for double-texting (multitask) strategy handling.
 
-Covers the admission gate (`_apply_multitask_strategy`), the queued-run
-dispatch (`BaseExecutor.dispatch_next_for_thread`) and the run_status guards
-the gate relies on (start/finalize CAS, queued cancel, lock order).
+Covers the admission gate, queued-run dispatch and the run_status guards the gate relies on.
 """
 
 import asyncio
@@ -38,11 +36,8 @@ def _fake_run(run_id: str = "run-1", status: str = "running") -> MagicMock:
 
 
 def _session_with_active(active: list[MagicMock], *, terminal_run: MagicMock | None = None) -> AsyncMock:
-    """Mock session whose active-run query returns ``active``.
-
-    ``terminal_run`` is the most-recent-terminal-run row the rollback no-active
-    path looks up (it reads ``.run_id`` and ``.status``); None means none exists.
-    """
+    """Mock session whose active-run query returns ``active``; ``terminal_run`` is the row the
+    idle-thread rollback lookup returns (None means no terminal run exists)."""
     session = AsyncMock()
     result = MagicMock()
     result.all.return_value = active
@@ -190,9 +185,8 @@ class TestApplyMultitaskStrategy:
 
     @pytest.mark.asyncio
     async def test_interrupt_of_pending_run_starts_immediately(self) -> None:
-        # A pre-empted run that has not started cannot start anymore (its start CAS fails once
-        # this commits, and the row lock keeps it from slipping to running underneath), so there
-        # is nothing to wait for and no task to cancel.
+        # A pre-empted run that has not started never will (its start CAS fails once this
+        # commits), so there is nothing to wait for and no task to cancel.
         pending = _fake_run(run_id="p1", status="pending")
         session = _session_with_active([pending])
 
@@ -302,10 +296,8 @@ class TestDispatchNextForThread:
 
     @pytest.mark.asyncio
     async def test_noop_when_thread_interrupted(self) -> None:
-        # A HITL-paused thread must NOT have a queued fresh-input run promoted onto it.
-        # side_effect is padded with the occupying + queued lookups so that REMOVING the
-        # guard reaches the promotion and fails on `submitted == []` (a behavioral failure),
-        # not on StopAsyncIteration.
+        # side_effect is padded with the occupying + queued lookups so that removing the HITL
+        # guard fails on `submitted == []`, not on StopAsyncIteration.
         ex = _RecordingExecutor()
         queued = _fake_run(run_id="queued-1", status="queued")
         session = AsyncMock()
@@ -519,9 +511,8 @@ class TestResolveRollbackBase:
 
     @pytest.mark.asyncio
     async def test_second_rollback_anchors_to_lineage_not_sibling(self) -> None:
-        # After P -> A(rolled back) -> B(forked from cp-P): history DESC interleaves the
-        # abandoned A branch. A second rollback targeting B must fork from cp-P (B's parent),
-        # NOT cp-A — the flat "first different run_id" scan would wrongly pick cp-A.
+        # P -> A(rolled back) -> B(forked from cp-P): history DESC interleaves the abandoned A
+        # branch, and a second rollback targeting B must fork from cp-P (B's parent), not cp-A.
         graph = MagicMock()
         graph.aget_state_history = _history(
             _FakeSnap("B", "cp-B", parent_checkpoint_id="cp-P"),
@@ -567,10 +558,8 @@ class TestResolveRollbackBase:
 
     @pytest.mark.asyncio
     async def test_ignores_straggler_from_cancelled_target(self) -> None:
-        # The cancelled target writes a late 'straggler' checkpoint after the new run forked
-        # and wrote its own. The base must still be the target's ORIGINAL oldest parent (cp-P),
-        # not the straggler's parent. The order-independent full scan handles this; the old
-        # early-break version would mis-anchor on the straggler.
+        # The cancelled target writes a late 'straggler' checkpoint after the new run forked;
+        # the base must still be the target's original oldest parent (cp-P), not the straggler's.
         graph = MagicMock()
         graph.aget_state_history = _history(
             _FakeSnap("A", "cp-straggler", parent_checkpoint_id="cp-Bnew"),  # newest: A's late write
@@ -598,9 +587,8 @@ class TestResolveRollbackBase:
 
     @pytest.mark.asyncio
     async def test_raises_when_cap_ends_on_non_target_row(self) -> None:
-        # The window fills with interleaved sibling rows ending on a NON-target row while
-        # older target checkpoints lie beyond it — the in-window "oldest" target is really
-        # mid-run, so resolution must fail loud instead of forking from it.
+        # A full window whose oldest in-window target row still has a parent may be mid-run
+        # (older target rows lie beyond it), so resolution must fail loud instead of forking.
         graph = MagicMock()
         graph.aget_state_history = _history(
             _FakeSnap("target", "cp-9", parent_checkpoint_id="cp-8"),
@@ -786,9 +774,8 @@ class TestFinalizeRunGuard:
 
     @pytest.mark.asyncio
     async def test_non_owned_finalize_leaves_thread_alone_but_still_dispatches(self) -> None:
-        # No row returned => the run was already terminalized by a pre-emption gate; finalize
-        # must not clobber the thread (e.g. stomp a HITL pause to 'idle'). It still dispatches:
-        # this exit is what a run parked behind the pre-empted one is waiting for.
+        # No row returned => a pre-emption gate already terminalized the run; finalize must not
+        # touch the thread but still dispatches, since this exit is what a parked run waits for.
         executed: list[str] = []
         session = AsyncMock()
 
@@ -815,11 +802,8 @@ class TestFinalizeRunGuard:
 
 
 def _capturing_session(*, rowcount: int = 1, returning: object = "row") -> tuple[AsyncMock, list[str]]:
-    """Mock session whose execute() records compiled statements.
-
-    ``rowcount`` feeds ``.rowcount`` and ``returning`` feeds ``.scalar_one_or_none()`` (the
-    ``UPDATE ... RETURNING`` guards read the latter; None means the guard matched nothing).
-    """
+    """Mock session whose execute() records compiled statements; ``returning`` feeds
+    ``.scalar_one_or_none()`` for the ``UPDATE ... RETURNING`` guards (None = no match)."""
     captured: list[str] = []
     session = AsyncMock()
 
@@ -888,10 +872,8 @@ class TestCancelQueuedRun:
 class TestInterruptUnownedRunDispatch:
     @pytest.mark.asyncio
     async def test_reconciled_cancel_locks_thread_first_and_leaves_dispatch_to_caller(self) -> None:
-        # Same lock order as the admission gate (thread, then run). It does NOT promote the
-        # queue itself: in dev mode claimed_by is always NULL, so this reconciles runs whose
-        # local task is still executing — only the caller can tell, and a live task's exit is
-        # what dispatches. Promoting here would put two graphs on the thread.
+        # Same lock order as the admission gate (thread, then run), and no promotion here: only
+        # the caller knows whether a local task still executes the run (dev never sets claimed_by).
         session, captured = _capturing_session(returning="run-1")
         with patch("aegra_api.services.run_status.dispatch_next_queued_run", new_callable=AsyncMock) as dispatched:
             assert await interrupt_unowned_run(session, "run-1", "thread-1", user_id="u") is True
@@ -902,9 +884,8 @@ class TestInterruptUnownedRunDispatch:
 
     @pytest.mark.asyncio
     async def test_live_owned_run_releases_the_thread_lock(self) -> None:
-        # Regression (prod e2e cancel?wait=1 returned `running`): with a live worker owning the
-        # run nothing is written, so the caller's session must drop the thread lock at once —
-        # the worker's finalize takes the same lock first and would otherwise wait out the request.
+        # With a live worker owning the run nothing is written, so the caller's session must drop
+        # the thread lock at once: the worker's finalize takes that lock first.
         session, captured = _capturing_session(returning=None)
         with patch("aegra_api.services.run_status.dispatch_next_queued_run", new_callable=AsyncMock) as dispatched:
             assert await interrupt_unowned_run(session, "run-1", "thread-1", user_id="u") is False

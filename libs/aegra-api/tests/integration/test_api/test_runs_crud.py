@@ -717,9 +717,8 @@ class TestDeleteRun:
         mock_dispatch.assert_awaited_with("test-thread-123")
 
     def test_delete_run_force_queued_run_promoted_meanwhile_is_cancelled_not_deleted(self):
-        """Regression for the promotion race: the run read as queued was promoted (and has
-        started) before the drop — it is cancelled like an active run and, while it is still
-        executing, neither deleted underneath the live task nor overtaken by the queue."""
+        """A run read as queued but promoted before the drop is cancelled like an active run and,
+        while executing, neither deleted underneath the live task nor overtaken by the queue."""
         app = create_test_app(include_runs=True, include_threads=False)
 
         run = _run_row(status="queued")
@@ -765,9 +764,8 @@ class TestDeleteRun:
         mock_dispatch.assert_not_awaited()
 
     def test_delete_run_force_waits_for_a_worker_owned_run_to_stop(self):
-        """A run owned by a worker elsewhere stops asynchronously: the row is removed (and the
-        queue behind it promoted) only after its terminal write lands, not while it may still
-        be writing checkpoints."""
+        """A worker-owned run stops asynchronously: the row is removed and the queue promoted only
+        after its terminal write lands, not while it may still be writing checkpoints."""
         app = create_test_app(include_runs=True, include_threads=False)
 
         run = _run_row(status="running")

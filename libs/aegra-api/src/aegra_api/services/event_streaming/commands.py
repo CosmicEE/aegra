@@ -221,14 +221,8 @@ async def _thread_is_interrupted(session: AsyncSession, thread_id: str, user: Us
 
 
 async def _thread_interrupted_with_settle(session: AsyncSession, thread_id: str, user: User) -> bool:
-    """Interrupt check for run.start input classification, settle-aware.
-
-    The interrupt event reaches the client (via the broker) before finalize_run
-    commits thread_status='interrupted' (see run_preparation's settle note). A client
-    answering the instant it sees the interrupt would be misclassified as fresh input
-    and parked behind the pause forever — so when a run is still in flight, poll fresh
-    sessions for the commit before deciding.
-    """
+    """Interrupt check that waits for an in-flight run to settle: the interrupt event reaches the
+    client before finalize_run commits, so an instant resume would otherwise classify as fresh input."""
     if await _thread_is_interrupted(session, thread_id, user):
         return True
     in_flight = await session.scalar(

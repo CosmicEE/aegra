@@ -28,9 +28,8 @@ _RETRY = object()
 class BaseExecutor(ABC):
     """Dispatches RunJobs for execution and tracks their lifecycle."""
 
-    # Cleared by _begin_shutdown() so a run finalizing during shutdown does not
-    # promote a queued run that would be orphaned when the process exits. Queued
-    # runs are picked up by recovery (startup sweep / reaper) instead.
+    # Cleared by _begin_shutdown() so a finalize during shutdown does not promote a queued
+    # run the exiting process would orphan; recovery (startup sweep / reaper) picks it up.
     _accepting: bool = True
     # Dispatches past the _accepting check; _begin_shutdown() waits for them so a
     # promotion cannot commit queued->pending and submit() behind the drain.
@@ -58,13 +57,8 @@ class BaseExecutor(ABC):
         """Drain in-flight work and release resources (called during shutdown)."""
 
     async def _begin_shutdown(self) -> None:
-        """Stop accepting queued-run dispatches and wait for the in-flight ones.
-
-        Subclasses call this first in ``stop()``. A dispatch that passed the
-        ``_accepting`` check has already counted itself in (no await between the
-        two), so once this returns no dispatch can commit or submit behind the
-        drain that follows.
-        """
+        """Stop accepting queued-run dispatches and wait for in-flight ones; first step of ``stop()``.
+        A dispatch counts itself in synchronously after the ``_accepting`` check, so none slips past."""
         self._accepting = False
         while self._inflight_dispatches > 0:
             if self._dispatches_idle is None:
@@ -73,13 +67,8 @@ class BaseExecutor(ABC):
             await self._dispatches_idle.wait()
 
     async def dispatch_next_for_thread(self, thread_id: str) -> None:
-        """Promote the oldest queued run on a thread and submit it.
-
-        Called after a run finalizes (or is cancelled / pre-empted) to start the
-        next double-texted run. Locks the thread row so concurrent finalizes and
-        reapers can't double dispatch, and no-ops if another run is already
-        occupying the thread or a human-in-the-loop pause holds it.
-        """
+        """Promote and submit the oldest queued run on a thread under the thread row lock;
+        a no-op while a run occupies the thread or a human-in-the-loop pause holds it."""
         if not self._accepting:
             return
         self._inflight_dispatches += 1
@@ -110,10 +99,8 @@ class BaseExecutor(ABC):
                 # Deleted underneath us (its runs cascade with it): nothing to promote onto.
                 return None
             if thread.status == "interrupted" and settings.multitask.MULTITASK_PAUSED_THREAD_POLICY == "reject":
-                # Thread is paused on a human-in-the-loop interrupt(). Promoting a queued
-                # fresh-input run would run it against the paused checkpoint and consume the
-                # pending interrupt — the admission 409 guard only covers run creation, so the
-                # guard must also hold here. Leave queued runs parked until a resume clears it.
+                # Paused on a human-in-the-loop interrupt(): promoting fresh input would consume
+                # the pending interrupt, and the admission guard only covers run creation.
                 return None
             occupying = await session.scalar(
                 select(RunORM.run_id)
@@ -143,9 +130,8 @@ class BaseExecutor(ABC):
             try:
                 job = RunJob.from_run_orm(run_orm)
             except (ValueError, KeyError, TypeError) as exc:
-                # Corrupt/legacy row (missing or malformed execution_params): it can never run,
-                # so fail it instead of letting every recovery sweep trip over it, and let the
-                # caller try the run parked behind it right away.
+                # Corrupt/legacy row (bad execution_params) can never run: fail it so recovery
+                # sweeps stop tripping over it, and retry with the run parked behind it.
                 run_orm.status = "error"
                 run_orm.error_message = f"Queued run cannot be dispatched: {exc!r}"
                 run_orm.updated_at = datetime.now(UTC)

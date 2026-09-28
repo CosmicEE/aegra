@@ -465,19 +465,8 @@ class EventStreamingSettings(EnvBase):
 
 
 class MultitaskSettings(EnvBase):
-    """Double-texting (``multitask_strategy``) admission policy.
-
-    MULTITASK_PAUSED_THREAD_POLICY decides what a fresh-input run (no ``command``)
-    does on a thread paused at a human-in-the-loop ``interrupt()``:
-
-    - ``reject`` (default): 409. Only a ``command={'resume': ...}`` run can clear the
-      pause, and queued runs stay parked behind it. The safe default for approval
-      flows, where a stray message must not bypass a pending review.
-    - ``admit``: the run is admitted and LangGraph starts it from ``__start__``,
-      discarding the pending interrupt (its behaviour for new input on an interrupted
-      thread, and what LangGraph Platform does). Message and resume then serialize
-      under the admission lock, first one wins.
-    """
+    """Double-texting admission policy: MULTITASK_PAUSED_THREAD_POLICY decides whether fresh input on
+    a thread paused at ``interrupt()`` is rejected (409) or admitted; see docs/guides/double-texting.mdx."""
 
     MULTITASK_PAUSED_THREAD_POLICY: Literal["reject", "admit"] = "reject"
 

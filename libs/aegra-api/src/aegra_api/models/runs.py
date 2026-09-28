@@ -179,8 +179,7 @@ class Run(BaseModel):
     """Run entity model
 
     Status values: pending, running, error, success, timeout, interrupted.
-    A run parked behind another run (double-texting enqueue) is internally
-    'queued' and reported as 'pending', matching the LangGraph SDK vocabulary.
+    A run parked behind another (internal 'queued') is reported as 'pending'.
     """
 
     model_config = ConfigDict(from_attributes=True)

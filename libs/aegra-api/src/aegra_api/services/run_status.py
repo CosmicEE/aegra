@@ -30,11 +30,8 @@ QUEUED_RUN_STATE = "queued"
 
 
 async def start_run(run_id: str, *, user_id: str) -> bool:
-    """Move an active run to running without reviving a terminal run.
-
-    Also the guard against a multitask gate pre-emption: a run the gate moved to
-    ``interrupted`` between dispatch and start must not resurrect itself.
-    """
+    """Move an active run to running via CAS, so a run cancelled or pre-empted between dispatch
+    and start cannot resurrect itself."""
     maker = _get_session_maker()
     async with maker() as session:
         result = await session.execute(
@@ -56,11 +53,7 @@ async def start_run(run_id: str, *, user_id: str) -> bool:
 
 
 async def get_run_status(run_id: str) -> str | None:
-    """Return a run's current status, or None if the run no longer exists.
-
-    Used at rollback-fork time to re-read the target's status, so a run that
-    raced to success after the admission gate is not reverted.
-    """
+    """Return a run's current status, or None if the run no longer exists."""
     maker = _get_session_maker()
     async with maker() as session:
         return await session.scalar(select(RunORM.status).where(RunORM.run_id == run_id))
@@ -95,8 +88,7 @@ async def set_thread_status_if_no_active_runs(
     """Update threads that no longer have a pending or running run.
 
     Does not commit so callers can keep the run and thread transitions in
-    one transaction. Queued runs do not count: they hold no task, and the
-    dispatch that promotes one marks the thread busy itself.
+    one transaction. Queued runs hold no task, so they do not count.
     """
     if not thread_ids:
         return
@@ -123,12 +115,8 @@ async def set_thread_status_if_no_active_runs(
 
 
 async def _lock_thread_row(session: AsyncSession, thread_id: str) -> None:
-    """Take the thread row lock FIRST, matching the multitask admission gate.
-
-    The gate locks thread-then-run rows; every writer that touches a run row and
-    then its thread must take the thread lock first too, or an interrupt/rollback
-    create racing that writer deadlocks (40P01). Locking a missing row is a no-op.
-    """
+    """Take the thread row lock before any run row, matching the admission gate; the reverse
+    order deadlocks (40P01) against a concurrent interrupt/rollback create."""
     await session.execute(select(ThreadORM.thread_id).where(ThreadORM.thread_id == thread_id).with_for_update())
 
 
@@ -145,20 +133,11 @@ async def interrupt_unowned_run(
     or claims the run concurrently cannot be overwritten by the API process.
     If a live worker merely missed its lease, the caller asks it to stop through
     the broker, and guarded finalization rejects any late worker write.
-
-    Does not dispatch the thread's queued runs: only the caller knows whether a
-    task may still be executing this run (a local task, or a worker whose lease
-    lapsed but is still alive). Promoting while one is would put two graphs on
-    the thread; the task's own exit (a finalize that loses the ownership CAS)
-    dispatches the queue in that case.
+    Does not dispatch queued runs: only the caller knows whether a task still executes this one.
     """
     now = datetime.now(UTC)
-    # Lock-then-CAS inside a SAVEPOINT. When the run turns out to be live-owned nothing is
-    # written, and rolling the savepoint back releases the thread lock at once — holding it
-    # for the rest of the caller's request would block the owner's finalize, which takes
-    # the same lock first (with cancel?wait=1 that is the whole poll window). A savepoint,
-    # unlike session.rollback(), leaves the caller's transaction and loaded rows intact, so
-    # a bulk cancel can keep iterating them.
+    # Lock-then-CAS in a SAVEPOINT: on a miss, rolling it back releases the thread lock at once
+    # (the owner's finalize needs it) without expiring rows a bulk cancel is still iterating.
     savepoint = await session.begin_nested()
     await _lock_thread_row(session, thread_id)
     result = cast(
@@ -202,17 +181,8 @@ async def cancel_queued_run(
     *,
     user_id: str,
 ) -> bool:
-    """Drop a parked (``queued``) run. Returns False when it is no longer queued.
-
-    A queued run has no task or worker to cancel and does not occupy its thread,
-    so a guarded status flip is the whole cancellation — the thread row is left
-    alone (it may belong to the active run, or hold a HITL pause). A False return
-    means the run was promoted or finished between the caller's read and this
-    write; the caller then treats it as an active run, so a run promoted inside
-    that window is still cancelled rather than deleted underneath a live task.
-    If the cancelled run headed a stranded queue (its active predecessor already
-    gone), the runs parked behind it are dispatched now, not on the next sweep.
-    """
+    """Drop a parked (``queued``) run with a guarded status flip; the thread row is left alone.
+    False means it was promoted or finished meanwhile and must be cancelled as an active run."""
     result = await session.execute(
         update(RunORM)
         .where(
@@ -251,12 +221,8 @@ async def finalize_run(
 ) -> bool:
     """Conditionally update run and thread status in one transaction.
 
-    Returns false when another actor has already made the run terminal: an
-    expired worker must not overwrite a reconciled cancellation, and a run a
-    multitask gate pre-empted must not stomp the thread state its replacement
-    now owns. Either way, the thread's next queued run is dispatched afterwards
-    — a finalize that lost the race can still be the moment the thread's task
-    actually stopped, which is what a parked replacement is waiting for.
+    Returns false when another actor has already made the run terminal (a reconciled
+    cancellation or a multitask pre-emption). Dispatches the next queued run either way.
     """
     validated_run = validate_run_status(status)
     validated_thread = validate_thread_status(thread_status)
@@ -304,14 +270,9 @@ async def finalize_run(
 
 
 async def dispatch_next_queued_run(thread_id: str) -> None:
-    """Best-effort: promote the oldest queued run on the thread if nothing occupies it.
-
-    Idempotent (a no-op while a run is pending/running or a HITL pause holds the
-    thread). A dispatch failure must not bubble into the caller's error path and
-    clobber the status it just committed — the queued run is durable, and the
-    reaper / startup sweep re-dispatch stranded queues. Deferred import: executor
-    -> run_executor -> run_status would cycle at module load.
-    """
+    """Best-effort promotion of the oldest queued run; idempotent while the thread is occupied or
+    paused. Failures are logged, not raised: recovery sweeps re-dispatch stranded queues."""
+    # Deferred: executor -> run_executor -> run_status would cycle at module load.
     from aegra_api.services.executor import executor
 
     try:

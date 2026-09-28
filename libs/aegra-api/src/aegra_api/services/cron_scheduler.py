@@ -216,10 +216,8 @@ class CronScheduler:
                 schedule_background_cleanup(_run_id, thread_id, cron.user_id)
         except HTTPException as exc:
             if exc.status_code == 409:
-                # The thread is busy and the cron's multitask_strategy is `reject`, or it
-                # is paused on a HITL interrupt. That is this occurrence's answer: skip it
-                # and advance, rather than release the claim and re-fire every tick until
-                # the thread frees — which would be `enqueue` in disguise.
+                # Busy thread under `reject`, or a HITL pause: that is this occurrence's answer.
+                # Re-firing every tick until the thread frees would be `enqueue` in disguise.
                 skipped = True
                 logger.info(
                     "Cron occurrence skipped: thread busy",

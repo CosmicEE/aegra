@@ -47,16 +47,8 @@ _RESUME_SETTLE_INTERVAL_SECONDS = 0.1
 async def _validate_resume_command(
     session: AsyncSession, thread_id: str, command: dict[str, Any] | None, user: User
 ) -> None:
-    """Validate a run's input mode against the thread's interrupt state.
-
-    A command bearing a ``resume`` key requires the thread to be paused, and a
-    ``None`` resume payload is rejected outright: LangGraph's ``map_command``
-    drops it, so the run would produce no writes and crash the pause to 'error'.
-    Symmetrically, a plain fresh-input run (no command) must not land on a thread
-    paused at a human-in-the-loop ``interrupt()``: running plain input there
-    silently consumes the pending interrupt, so reject and direct the caller to
-    resume with a command.
-    """
+    """Validate input against the thread's pause state: ``resume`` needs a paused thread and a
+    non-``None`` payload; plain input on a paused thread would consume the pending interrupt."""
     if command is not None:
         # Reject a malformed command shape up front (e.g. {'goto': [0]}) so it can't bypass the
         # gate and crash to 'error' mid-run — which on a paused thread would corrupt the HITL pause.
@@ -67,16 +59,12 @@ async def _validate_resume_command(
     # Key presence, not a non-None value: {'resume': None} must be gated as a resume
     # attempt too, or it slips through and errors out mid-run on whatever thread it hits.
     resume_shaped = command is not None and "resume" in command
-    # Truthiness matches LangGraph's map_command (`if cmd.update:` / `if cmd.goto:`): an
-    # empty container ({'update': {}}, {'goto': []}) produces no writes and would crash a
-    # paused thread to 'error', so it must NOT early-return — it falls through to the gate.
+    # Truthiness matches LangGraph's map_command: an empty update/goto produces no writes and
+    # would crash a paused thread to 'error', so it must fall through to the gate below.
     state_op = bool(command and (command.get("update") or command.get("goto")))
     if command is not None and not resume_shaped and state_op:
-        # A deliberate update/goto command manipulates graph state directly and is allowed even
-        # on a paused thread. Safety here leans on two LangGraph behaviours: empty containers are
-        # falsy (so they fall through to the 409 gate, not here), and an unknown goto/Send target
-        # is silently ignored rather than raising. If a future LangGraph version raised on unknown
-        # targets, such a command could crash mid-run and clobber a HITL pause — gate it here then.
+        # A deliberate update/goto manipulates state directly and is allowed on a paused thread;
+        # safe only while LangGraph ignores unknown goto targets instead of raising mid-run.
         return
 
     thread_stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
@@ -111,9 +99,8 @@ async def _validate_resume_command(
         and thread.status == "interrupted"
         and settings.multitask.MULTITASK_PAUSED_THREAD_POLICY == "reject"
     ):
-        # Under the `admit` policy the run goes through instead: LangGraph starts it
-        # from __start__ and drops the pending interrupt, and message-vs-resume then
-        # serializes under the admission lock, first one wins.
+        # Under `admit` the run goes through: LangGraph restarts from __start__ and drops the
+        # pending interrupt; message vs resume then serialize under the admission lock.
         raise HTTPException(
             409,
             "Thread is paused on a human-in-the-loop interrupt; resume it with "
@@ -220,11 +207,8 @@ async def update_thread_metadata(
             "thread_name": thread_name,
         }
 
-        # Insert and let the primary key arbitrate. Two first runs racing on a brand-new
-        # thread_id both miss the read above; with a plain INSERT the loser dies on
-        # thread_pkey at commit (a 500). ON CONFLICT DO NOTHING makes it wait for the
-        # winner's commit instead and fall through to the merge below — and the multitask
-        # gate that follows then sees the winner's run as active and applies the strategy.
+        # Let the primary key arbitrate two first runs racing on a new thread_id: the loser waits
+        # for the winner's commit and falls through to the merge, and the gate then sees its run.
         insert_stmt = (
             pg_insert(ThreadORM)
             .values(
@@ -299,27 +283,8 @@ _TERMINAL_RUN_STATUSES = ("interrupted", "error", "success")
 async def _apply_multitask_strategy(
     session: AsyncSession, thread_id: str, strategy: str, user: User, *, is_resume: bool = False
 ) -> tuple[bool, list[str], str | None]:
-    """Resolve a new run against the thread's in-flight runs per ``strategy``.
-
-    Locks the thread row ``FOR UPDATE``, then the thread's active run rows
-    (thread-then-run order, matching finalize_run) so concurrent creates
-    serialize and a pre-empted run cannot slip from ``pending`` to ``running``
-    underneath the decision. Returns ``(should_run, cancel_ids,
-    rollback_target_run_id)``: should_run is True to execute now, False to park
-    as ``queued``; cancel_ids are runs the caller cancels AFTER commit (so the
-    lock is released before the cancel triggers the run's own finalize);
-    rollback_target_run_id is the prior run whose checkpoints the worker will
-    revert by forking. Raises 409 for reject. interrupt/rollback mark the active
-    run interrupted (no rows are deleted — rollback reverts via a checkpoint
-    fork, leaving the old branch as harmless siblings).
-
-    interrupt/rollback are strictly serialized: when the pre-empted run is
-    ``running`` its graph may still be writing checkpoints until its task exits,
-    so the new run is parked and promoted by that run's exit (its finalize loses
-    the ownership CAS and dispatches the queue). A ``pending`` pre-empted run has
-    provably not started — its start CAS fails after this commit — so the new
-    run starts right away.
-    """
+    """Resolve a new run against the thread's in-flight runs under thread-then-run ``FOR UPDATE``
+    locks (matching finalize_run); returns ``(should_run, cancel_ids, rollback_target_run_id)``."""
     await session.execute(
         select(ThreadORM.thread_id)
         .where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
@@ -338,10 +303,8 @@ async def _apply_multitask_strategy(
         )
     ).all()
     if is_resume:
-        # A resume jumps ahead of merely-*queued* runs (it alone can clear a HITL pause), but
-        # must still serialize behind a running/pending run. Checked under the FOR UPDATE lock,
-        # this rejects a second concurrent resume (which unblocks after the first commits its
-        # pending run) so two resumes cannot double-execute on one paused checkpoint.
+        # A resume skips merely-queued runs (it alone can clear a HITL pause) but serializes
+        # behind running/pending ones, which under the lock also rejects a second concurrent resume.
         if any(run.status in _CANCELLABLE_RUN_STATUSES for run in active):
             raise HTTPException(status_code=409, detail=f"Thread '{thread_id}' already has an active run")
         return True, [], None
@@ -368,9 +331,8 @@ async def _apply_multitask_strategy(
     if strategy == "enqueue":
         return False, [], None
 
-    # interrupt / rollback: abandon all in-flight work (the active run AND any runs the
-    # user double-texted earlier that are still queued), then run the new one — right
-    # away if nothing pre-empted is executing, else as soon as the executing run exits.
+    # interrupt / rollback: abandon the active run and everything queued behind it. The new run
+    # starts now unless a pre-empted run is still executing, then as soon as it exits.
     cancel_ids: list[str] = []
     rollback_target: str | None = None
     wait_for_running = False
@@ -549,10 +511,8 @@ async def _prepare_run(
 
     run = Run.model_validate(run_orm)
 
-    # Cancel pre-empted runs after commit so the thread lock is released before
-    # the cancel triggers their finalize (which also locks the thread row). That
-    # finalize loses the ownership CAS (the gate already wrote 'interrupted') and
-    # dispatches the queue, which is what promotes the run parked just below.
+    # Cancel after commit: the cancelled runs' finalize takes the thread lock too, loses the
+    # ownership CAS (the gate wrote 'interrupted') and dispatches the run parked just below.
     for cancelled_id in cancel_ids:
         await streaming_service.cancel_run(cancelled_id)
 

@@ -79,7 +79,10 @@ the new run begins immediately.
   and the graph re-enters from `__start__` with no orphan left to repair. No
   checkpoints are deleted; the old branch survives as harmless siblings, so
   `GET /threads/{id}/history` shows both branches while `state` returns the new
-  clean head. With an active run, `rollback` reverts that run. On an *idle* thread
+  clean head. The fork point is resolved by lineage — the parent of the rolled-back
+  run's oldest checkpoint — over the thread's most recent 1000 checkpoints; a run
+  whose history exceeds that window fails the rollback rather than fork from the
+  wrong point. With an active run, `rollback` reverts that run. On an *idle* thread
   it repairs a broken last turn — reverting the most recent run only if it was
   left `interrupted` or `error` (e.g. an orphaned tool call); a cleanly completed
   run is left untouched, so `rollback` never silently undoes a successful turn.

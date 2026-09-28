@@ -920,9 +920,8 @@ async def delete_thread(
     active_runs_list = (await session.scalars(active_runs_stmt)).all()
 
     if any(run.status == QUEUED_RUN_STATE for run in active_runs_list):
-        # A parked run has no task to cancel, and the active run's finalize would promote
-        # it onto the thread being deleted. Drop the parked rows first (guarded: a run
-        # promoted in between no longer matches and is re-read below as active).
+        # Drop parked rows first (guarded flip): they have no task to cancel, and the active
+        # run's finalize would otherwise promote one onto the thread being deleted.
         await session.execute(
             update(RunORM)
             .where(

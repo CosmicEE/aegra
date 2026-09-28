@@ -484,9 +484,8 @@ class TestTerminalStateRaces:
 class TestPreemptedBeforeStart:
     @pytest.mark.asyncio
     async def test_gate_preempted_run_skips_execution_and_finalize(self) -> None:
-        """A run whose start CAS fails (a multitask gate terminalized it between dispatch
-        and start) must not execute the graph or finalize — the gate owns its status —
-        but it releases attached streams/waiters and lets a parked replacement start."""
+        """A run whose start CAS fails must not execute or finalize (the gate owns its status),
+        but it releases attached streams and lets a parked replacement start."""
         mock_finalize = AsyncMock()
         mock_dispatch = AsyncMock()
 
