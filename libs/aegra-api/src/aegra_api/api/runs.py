@@ -5,6 +5,7 @@ import contextlib
 from collections.abc import AsyncGenerator, MutableMapping
 from typing import Any
 
+import anyio
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -240,10 +241,15 @@ async def create_and_stream_run(
         # broker to cancel, so drop it in the database. Kept independent of the
         # broker step below so a failure in either one cannot skip the other.
         try:
-            if await cancel_queued_run_by_id(run_id, thread_id, user_id=user.identity):
-                return
+            # sse-starlette's anyio cancel punches through asyncio.shield (#530): shield the
+            # checkout so a disconnect mid-query cannot leak the pooled connection.
+            with anyio.CancelScope(shield=True):
+                dropped = await cancel_queued_run_by_id(run_id, thread_id, user_id=user.identity)
         except SQLAlchemyError:
+            dropped = False
             logger.exception("Failed to drop queued run on client disconnect", run_id=run_id)
+        if dropped:
+            return
         try:
             await broker_manager.request_cancel(run_id, "cancel")
         except (RedisError, OSError):
