@@ -54,8 +54,24 @@ _SETTLE_ATTEMPTS = 20
 _SETTLE_INTERVAL_SECONDS = 0.5
 
 
+async def _reread_run(session: AsyncSession, run_id: str, thread_id: str, user_id: str) -> RunORM | None:
+    """Re-read the run, returning None when it is gone.
+
+    ``session.refresh()`` raises ``ObjectDeletedError`` on a row another request deleted
+    meanwhile, turning a concurrent delete into a 500; a plain re-query reports it instead.
+    """
+    session.expire_all()  # sync method, clears cache
+    return await session.scalar(
+        select(RunORM).where(
+            RunORM.run_id == str(run_id),
+            RunORM.thread_id == thread_id,
+            RunORM.user_id == user_id,
+        )
+    )
+
+
 async def _wait_for_run_to_settle(session: AsyncSession, run_id: str) -> bool:
-    """Poll the database until the run is terminal (or gone). False when the window expired."""
+    """Poll until the run is terminal or its row is gone. False when the window expired."""
     for _ in range(_SETTLE_ATTEMPTS):
         await asyncio.sleep(_SETTLE_INTERVAL_SECONDS)
         session.expire_all()  # sync method, clears cache
@@ -587,8 +603,11 @@ async def cancel_run_endpoint(
     if wait:
         await _wait_for_run_to_settle(session, run_id)
 
-    await session.refresh(run_orm)
-    return Run.model_validate(run_orm)
+    fresh = await _reread_run(session, run_id, thread_id, user.identity)
+    if fresh is None:
+        # Deleted while the cancel was in flight: the cancellation landed, the run is gone.
+        raise HTTPException(404, f"Run '{run_id}' not found")
+    return Run.model_validate(fresh)
 
 
 @router.post("/runs/cancel", status_code=204, responses={**NOT_FOUND})
@@ -691,8 +710,14 @@ async def delete_run(
         if task:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-        await session.refresh(run_orm)
-        if run_orm.status in ACTIVE_RUN_STATES and not await _wait_for_run_to_settle(session, run_id):
+        fresh = await _reread_run(session, run_id, thread_id, user.identity)
+        # A row deleted meanwhile needs no wait: the DELETE below matches nothing and 204
+        # stays the honest answer for "this run is gone".
+        if (
+            fresh is not None
+            and fresh.status in ACTIVE_RUN_STATES
+            and not await _wait_for_run_to_settle(session, run_id)
+        ):
             # Owned by a worker elsewhere and still executing after the bounded wait. Never
             # delete a row a live worker owns, and never move the queue behind it: deleting
             # first would start the successor while that worker may still be writing

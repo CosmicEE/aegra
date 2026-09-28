@@ -363,6 +363,67 @@ class TestCancelRun:
             mock_streaming.signal_run_cancelled.assert_awaited_once_with("test-run-123")
 
 
+class TestCancelConcurrentDelete:
+    """A run deleted while the cancel is in flight reports 404, not a refresh crash."""
+
+    def test_cancel_run_deleted_meanwhile_is_404(self) -> None:
+        app = create_test_app(include_runs=True, include_threads=False)
+        run = _run_row(status="running")
+        reads = {"n": 0}
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: Any) -> Any:
+                reads["n"] += 1
+                # First read finds it; by the re-read another request has deleted the row.
+                return run if reads["n"] == 1 else None
+
+            async def commit(self) -> None:
+                pass
+
+        with (
+            patch("aegra_api.api.runs.streaming_service") as mock_streaming,
+            patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=True),
+            patch("aegra_api.api.runs.active_runs", {}),
+        ):
+            mock_streaming.cancel_run = AsyncMock()
+            mock_streaming.signal_run_cancelled = AsyncMock()
+            override_session_dependency(app, Session)
+            resp = make_client(app).post("/threads/test-thread-123/runs/test-run-123/cancel")
+
+        assert resp.status_code == 404  # not a 500 from refreshing a vanished row
+
+    def test_delete_run_force_tolerates_a_concurrent_delete(self) -> None:
+        """The row vanished while we cancelled it: no wait, no 409, still 204."""
+        app = create_test_app(include_runs=True, include_threads=False)
+        run = _run_row(status="running")
+        run.claimed_by = "worker-0"
+        reads = {"n": 0}
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: Any) -> Any:
+                reads["n"] += 1
+                return run if reads["n"] == 1 else None
+
+            async def execute(self, _stmt: Any) -> None:
+                pass
+
+            async def commit(self) -> None:
+                pass
+
+        with (
+            patch("aegra_api.api.runs.streaming_service") as mock_streaming,
+            patch("aegra_api.api.runs.interrupt_unowned_run", new_callable=AsyncMock, return_value=False),
+            patch("aegra_api.api.runs.active_runs", {}),
+            patch("aegra_api.api.runs._wait_for_run_to_settle", new_callable=AsyncMock) as mock_wait,
+        ):
+            mock_streaming.cancel_run = AsyncMock()
+            override_session_dependency(app, Session)
+            resp = make_client(app).delete("/threads/test-thread-123/runs/test-run-123?force=1")
+
+        assert resp.status_code == 204
+        mock_wait.assert_not_awaited()  # nothing left to wait for
+
+
 class TestCancelDispatchDecision:
     """After reconciling an unowned run, the queue moves only when nothing can still execute it."""
 
