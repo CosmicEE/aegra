@@ -24,6 +24,7 @@ from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.models import User
+from aegra_api.models.enums import MULTITASK_STRATEGIES
 from aegra_api.models.runs import RunCreate
 from aegra_api.services.event_streaming.protocol import ErrorCode, build_error, build_success
 from aegra_api.services.run_preparation import (
@@ -89,8 +90,6 @@ async def handle_command(
 
     return build_error(command_id, "unknown_command", f"Unknown command {method!r}."), None
 
-
-_MULTITASK_STRATEGIES = frozenset({"reject", "rollback", "interrupt", "enqueue"})
 
 # Protocol keys plus Aegra extensions per handler. Unknown keys are logged, never
 # silently dropped (#452); test_spec_params.py pins these against the spec.
@@ -171,7 +170,7 @@ async def _run_start(
         return build_error(command_id, "invalid_argument", "run.start requires a string assistant_id."), None
 
     multitask = params.get("multitaskStrategy", params.get("multitask_strategy"))
-    if multitask is not None and multitask not in _MULTITASK_STRATEGIES:
+    if multitask is not None and multitask not in MULTITASK_STRATEGIES:
         return build_error(command_id, "invalid_argument", f"Unknown multitaskStrategy {multitask!r}."), None
 
     context, error_message = _context_from_params(params)

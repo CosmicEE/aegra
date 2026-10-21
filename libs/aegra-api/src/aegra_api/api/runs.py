@@ -1,7 +1,6 @@
 """Run endpoints for Agent Protocol"""
 
 import asyncio
-import contextlib
 from collections.abc import AsyncGenerator, MutableMapping
 from typing import Any
 
@@ -706,8 +705,9 @@ async def delete_run(
     """Delete a run record.
 
     If the run is active (pending, running or enqueued) and `force=0`, returns 409
-    Conflict. Set `force=1` to cancel the run first and then delete it; a worker-owned
-    run that has not stopped within ~10 seconds is left in place with 409 for a retry.
+    Conflict. Set `force=1` to cancel the run first and then delete it; a run that has
+    not stopped within the bounded wait (~10 s of polling, after up to ~10 s on an
+    in-process task) is left in place with 409 for a retry.
     Returns 204 No Content on success.
     """
     # Deleting a run authorizes as a thread delete (Agent Protocol has no `runs`
@@ -739,11 +739,16 @@ async def delete_run(
     if force and was_active:
         logger.info(f"[delete_run] force-cancelling active run run_id={run_id}")
         await _request_run_interruption(session, run_orm, "cancel")
-        # Best-effort: wait for bg task to settle
+        # Best-effort: wait for the local task to settle, bounded like the row poll below so a task
+        # that ignores its cancel cannot hold the request forever.
         task = active_runs.get(run_id)
         if task:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=_SETTLE_ATTEMPTS * _SETTLE_INTERVAL_SECONDS)
+            except TimeoutError:
+                logger.info(f"[delete_run] run task still executing after the bounded wait run_id={run_id}")
+            except (asyncio.CancelledError, Exception) as exc:
+                logger.debug(f"[delete_run] run task ended with {type(exc).__name__}; the row decides run_id={run_id}")
         fresh = await _reread_run(session, run_id, thread_id, user.identity)
         # A row deleted meanwhile needs no wait: the DELETE below matches nothing and 204
         # stays the honest answer for "this run is gone".

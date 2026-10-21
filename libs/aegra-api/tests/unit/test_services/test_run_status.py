@@ -1,15 +1,21 @@
 """Unit tests for run_status service."""
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy.dialects import postgresql
 
 from aegra_api.services.run_status import (
+    INTERRUPT_REQUESTED_KEY,
     _safe_serialize,
     drop_queued_runs,
+    finalize_overdue_preemptions,
     finalize_run,
+    interrupt_requested,
+    interrupt_requested_expr,
     interrupt_unowned_run,
+    mark_interrupt_requested,
     queued_threads_stmt,
     set_thread_status,
     set_thread_status_if_no_active_runs,
@@ -364,4 +370,74 @@ class TestDropQueuedRuns:
         session.execute = AsyncMock(return_value=result)
 
         assert await drop_queued_runs(session, "thread-1", user_id="user-1") == []
+        session.commit.assert_not_awaited()
+
+
+class TestPreemptionStamp:
+    def test_mark_and_read(self) -> None:
+        run = MagicMock()
+        run.execution_params = {"behavior": {"multitask_strategy": "enqueue"}}
+        now = datetime(2026, 10, 19, tzinfo=UTC)
+
+        mark_interrupt_requested(run, now=now)
+
+        assert run.execution_params["behavior"] == {"multitask_strategy": "enqueue"}  # rest preserved
+        assert run.execution_params[INTERRUPT_REQUESTED_KEY] == now.isoformat()
+        assert interrupt_requested(run.execution_params) is True
+        assert interrupt_requested({}) is False and interrupt_requested(None) is False
+
+    def test_first_stamp_is_kept(self) -> None:
+        # A repeated interrupt double-text must not restart the pre-emption timeout clock.
+        run = MagicMock()
+        run.execution_params = {}
+        first = datetime(2026, 10, 19, tzinfo=UTC)
+
+        mark_interrupt_requested(run, now=first)
+        mark_interrupt_requested(run, now=datetime(2026, 10, 19, 0, 0, 30, tzinfo=UTC))
+
+        assert run.execution_params[INTERRUPT_REQUESTED_KEY] == first.isoformat()
+
+    def test_sql_expression_reads_the_key_as_text(self) -> None:
+        sql = str(
+            interrupt_requested_expr()
+            .is_(None)
+            .compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+        )
+        assert "runs.execution_params ->> '_interrupt_requested_at'" in sql
+
+    @pytest.mark.asyncio
+    async def test_overdue_preemptions_are_interrupted_and_threads_freed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings.multitask, "MULTITASK_PREEMPT_TIMEOUT_SECONDS", 60)
+        session = AsyncMock()
+        result = MagicMock()
+        result.all.return_value = [("run-1", "thread-1", "user-1"), ("run-2", "thread-1", "user-1")]
+        session.execute = AsyncMock(return_value=result)
+
+        with patch(
+            "aegra_api.services.run_status.set_thread_status_if_no_active_runs", new_callable=AsyncMock
+        ) as mock_thread:
+            done = await finalize_overdue_preemptions(session)
+
+        assert done == [("run-1", "thread-1"), ("run-2", "thread-1")]
+        sql = str(
+            session.execute.await_args_list[0]
+            .args[0]
+            .compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+        )
+        assert "runs.status = 'running'" in sql
+        assert "CAST(" in sql and "TIMESTAMP WITH TIME ZONE" in sql and "<" in sql  # stamp older than the timeout
+        assert "'interrupted'" in sql
+        lock_sql = str(session.execute.await_args_list[1].args[0].compile(dialect=postgresql.dialect()))
+        assert "FOR UPDATE" in lock_sql and "ORDER BY thread.thread_id" in lock_sql  # thread rows locked first
+        mock_thread.assert_awaited_once_with(session, {"thread-1"}, "idle", user_id="user-1")
+        assert session.commit.await_count == 2  # run rows first, thread rows in a second transaction
+
+    @pytest.mark.asyncio
+    async def test_nothing_overdue_commits_nothing(self) -> None:
+        session = AsyncMock()
+        result = MagicMock()
+        result.all.return_value = []
+        session.execute = AsyncMock(return_value=result)
+
+        assert await finalize_overdue_preemptions(session) == []
         session.commit.assert_not_awaited()

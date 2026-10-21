@@ -19,7 +19,14 @@ from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.redis_manager import redis_manager
 from aegra_api.observability.metrics import REAPER_RECOVERED_RUNS
 from aegra_api.services.executor import executor
-from aegra_api.services.run_status import ACTIVE_RUN_STATES, queued_threads_stmt, set_thread_status_if_no_active_runs
+from aegra_api.services.run_status import (
+    ACTIVE_RUN_STATES,
+    finalize_overdue_preemptions,
+    interrupt_requested,
+    queued_threads_stmt,
+    settle_threads_of,
+    with_thread_status,
+)
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -81,6 +88,10 @@ class LeaseReaper:
                 pushed = await self._reenqueue(lost)
                 REAPER_RECOVERED_RUNS.labels(outcome="stuck_pending").inc(len(pushed))
 
+        overdue = await self._finalize_overdue_preemptions()
+        if overdue:
+            REAPER_RECOVERED_RUNS.labels(outcome="preempt_timeout").inc(len(overdue))
+
         # Stranded queued (dispatch wakeup lost): scanned AFTER the crashed/stuck handling so a
         # head run failed just above gets its successor promoted this cycle, not the next.
         stranded_queued = await self._find_stranded_queued_threads()
@@ -88,7 +99,7 @@ class LeaseReaper:
             logger.warning("Dispatching stranded queued runs", thread_count=len(stranded_queued))
             await self._dispatch_stranded_queued(stranded_queued)
 
-        if not crashed and not stuck_pending and not stranded_queued:
+        if not crashed and not stuck_pending and not stranded_queued and not overdue:
             return
 
         logger.info(
@@ -96,7 +107,16 @@ class LeaseReaper:
             crashed_recovered=len(crashed),
             stuck_reenqueued=len(lost),
             stranded_dispatched=len(stranded_queued),
+            preempted_timed_out=len(overdue),
         )
+
+    @staticmethod
+    async def _finalize_overdue_preemptions() -> list[tuple[str, str]]:
+        """Pre-empted runs whose task ignored the cancel past the timeout; the stranded scan then
+        promotes their threads."""
+        maker = _get_session_maker()
+        async with maker() as session:
+            return await finalize_overdue_preemptions(session)
 
     @staticmethod
     async def _find_stranded_queued_threads() -> list[str]:
@@ -163,7 +183,8 @@ class LeaseReaper:
         max_retries = settings.worker.BG_JOB_MAX_RETRIES
         retryable: list[str] = []
         exhausted: list[str] = []
-        exhausted_threads_by_user: dict[str, set[str]] = {}
+        preempted: list[tuple[str, str, str]] = []
+        exhausted_rows: list[tuple[str, str, str]] = []
 
         maker = _get_session_maker()
         async with maker() as session:
@@ -184,7 +205,8 @@ class LeaseReaper:
 
             for run_id, thread_id, user_id, execution_params in locked_result.fetchall():
                 params = dict(execution_params or {})
-                retry_count = params.get("_retry_count", 0) + 1
+                is_preempted = interrupt_requested(params)
+                retry_count = params.get("_retry_count", 0) + (0 if is_preempted else 1)
                 params["_retry_count"] = retry_count
 
                 values: dict[str, object] = {
@@ -194,7 +216,11 @@ class LeaseReaper:
                     "updated_at": now,
                 }
                 is_exhausted = retry_count > max_retries
-                if is_exhausted:
+                if is_preempted:
+                    # A double-text already replaced this run; its worker died before stopping it.
+                    # Retrying would run it again ahead of the replacement, so it ends here.
+                    values["status"] = "interrupted"
+                elif is_exhausted:
                     values.update(
                         status="error",
                         error_message="Max retries exceeded after repeated worker failures",
@@ -216,9 +242,12 @@ class LeaseReaper:
                 if update_result.scalar_one_or_none() is None:
                     continue
 
-                if is_exhausted:
+                if is_preempted:
+                    preempted.append((run_id, thread_id, user_id))
+                    logger.info("Pre-empted run's worker died; run ends interrupted", run_id=run_id)
+                elif is_exhausted:
                     exhausted.append(run_id)
-                    exhausted_threads_by_user.setdefault(user_id, set()).add(thread_id)
+                    exhausted_rows.append((run_id, thread_id, user_id))
                     logger.error(
                         "Run exceeded max retries, marking as permanently failed",
                         run_id=run_id,
@@ -236,18 +265,16 @@ class LeaseReaper:
 
             await session.commit()
 
-        if not exhausted_threads_by_user:
+        if preempted:
+            REAPER_RECOVERED_RUNS.labels(outcome="crashed_preempted").inc(len(preempted))
+        if not exhausted_rows and not preempted:
             return retryable, exhausted
         # Thread rows only after the run-row locks above are released: the gate and finalize
         # lock thread-then-run, so holding both here in the reverse order could deadlock.
         async with maker() as session:
-            for user_id, thread_ids in exhausted_threads_by_user.items():
-                await set_thread_status_if_no_active_runs(
-                    session,
-                    thread_ids,
-                    "error",
-                    user_id=user_id,
-                )
+            await settle_threads_of(
+                session, [*with_thread_status(exhausted_rows, "error"), *with_thread_status(preempted, "idle")]
+            )
             await session.commit()
 
         return retryable, exhausted

@@ -70,8 +70,16 @@ run that is still executing is told to stop at once but keeps its `running` stat
 `interrupted`, and the new run — parked (reported `pending`) meanwhile — starts. So
 two graphs never write the same thread's checkpoints at the same time, and a third
 `interrupt`/`rollback`, a cancel or a recovery sweep arriving in that window parks
-or no-ops as well. A pre-empted run that had not started yet can no longer start, so
-it is marked `interrupted` right away and the new run begins immediately.
+or no-ops as well. The pre-emption is also recorded on the run itself, so it survives
+a lost cancel message: a worker sees the stamp on its next heartbeat and stops the run
+(keeping its lease until the task has exited), and the lease reaper and a shutdown drain
+end such a run as `interrupted` instead of retrying it. The one exception is a task that
+ignores the cancel altogether: after `MULTITASK_PREEMPT_TIMEOUT_SECONDS` (default 60,
+counted from the first pre-emption) the recovery sweeps mark it `interrupted` and
+promote the parked run anyway, so a graph that swallows cancellation can overlap its
+replacement for as long as it keeps running. A pre-empted run that had not started yet
+can no longer start, so it is marked `interrupted` right away and the new run begins
+immediately.
 
 ## Behavior notes
 

@@ -8,10 +8,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from aegra_api.core.orm import Run as RunORM
+from aegra_api.core.orm import get_session as core_get_session
 from aegra_api.services import run_preparation as run_preparation_mod
 from aegra_api.settings import settings
 from tests.fixtures.clients import create_test_app, make_client
-from tests.fixtures.session_fixtures import BasicSession, override_session_dependency
+from tests.fixtures.session_fixtures import BasicSession, override_get_session_dep, override_session_dependency
+from tests.fixtures.test_helpers import make_run_orm
 
 
 def _client() -> TestClient:
@@ -111,3 +114,32 @@ class TestResumeValidationAtHttpBoundary:
 
         assert resp.status_code == 400
         assert "not in interrupted state" in resp.json()["detail"]
+
+
+class _RunRowSession(BasicSession):
+    """Session whose run lookup returns one real ORM row (so the response reads its properties)."""
+
+    def __init__(self, run: RunORM) -> None:
+        super().__init__()
+        self._run = run
+
+    async def scalar(self, _stmt: object) -> object:
+        return self._run
+
+
+class TestRunRecordReportsStrategy:
+    def test_get_run_reports_the_admitted_strategy(self) -> None:
+        # The SDK's Run type carries multitask_strategy; it is read back from execution_params.
+        run = make_run_orm(
+            thread_id="test-thread-123",
+            assistant_id="asst-123",
+            user_id="test-user",
+            execution_params={"behavior": {"multitask_strategy": "rollback"}},
+        )
+        app = create_test_app(include_runs=True, include_threads=False)
+        app.dependency_overrides[core_get_session] = override_get_session_dep(lambda: _RunRowSession(run))
+
+        resp = make_client(app).get("/threads/test-thread-123/runs/run-1")
+
+        assert resp.status_code == 200
+        assert resp.json()["multitask_strategy"] == "rollback"

@@ -6,12 +6,12 @@ worker_executor). Extracted from api/runs.py to eliminate the circular
 dependency where service code imported from the API module.
 """
 
-from collections.abc import Collection
-from datetime import UTC, datetime
+from collections.abc import Collection, Iterable
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import structlog
-from sqlalchemy import CursorResult, Select, exists, or_, select, update
+from sqlalchemy import TIMESTAMP, ColumnElement, CursorResult, Select, exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.active_runs import active_runs
@@ -29,6 +29,84 @@ ACTIVE_RUN_STATES = ("pending", "running")
 # Internal double-texting park state: the run waits behind an active run and has no
 # task or worker. Reported as ``pending`` over the API (Run.validate_status).
 QUEUED_RUN_STATE = "queued"
+# Stamped into execution_params when a multitask gate pre-empts a live run, so the heartbeat,
+# the reaper and the drain path end it as ``interrupted`` even if the pub/sub cancel was lost.
+INTERRUPT_REQUESTED_KEY = "_interrupt_requested_at"
+
+
+def interrupt_requested_expr() -> ColumnElement[str]:
+    """The pre-emption stamp as SQL text (``->>``); NULL for a run that was never pre-empted."""
+    return RunORM.execution_params[INTERRUPT_REQUESTED_KEY].astext
+
+
+def mark_interrupt_requested(run: RunORM, *, now: datetime) -> None:
+    """Record the pre-emption on the row (a fresh dict, so the JSONB change is detected). The first
+    stamp stays: a repeated double-text must not restart the pre-emption timeout."""
+    params = run.execution_params or {}
+    if INTERRUPT_REQUESTED_KEY in params:
+        return
+    run.execution_params = {**params, INTERRUPT_REQUESTED_KEY: now.isoformat()}
+
+
+def interrupt_requested(execution_params: dict[str, Any] | None) -> bool:
+    return bool((execution_params or {}).get(INTERRUPT_REQUESTED_KEY))
+
+
+async def settle_threads_of(session: AsyncSession, ended: Iterable[tuple[str, str, str, str]]) -> None:
+    """Set the thread of each ended ``(run_id, thread_id, user_id, thread_status)`` row where nothing is
+    active any more; one statement per user and status, since the predicate is tenant-scoped. Does not commit."""
+    threads_by_target: dict[tuple[str, str], set[str]] = {}
+    for _run_id, thread_id, user_id, status in ended:
+        threads_by_target.setdefault((user_id, status), set()).add(thread_id)
+    if not threads_by_target:
+        return
+    # Thread rows are locked first (the gate's order), so an admission committing meanwhile is seen
+    # by the no-active-run check; one sorted batch per call, so two sweeps cannot deadlock on each other.
+    thread_ids_sorted = sorted({thread_id for ids in threads_by_target.values() for thread_id in ids})
+    await session.execute(
+        select(ThreadORM.thread_id)
+        .where(ThreadORM.thread_id.in_(thread_ids_sorted))
+        .order_by(ThreadORM.thread_id)
+        .with_for_update()
+    )
+    for (user_id, status), thread_ids in threads_by_target.items():
+        await set_thread_status_if_no_active_runs(session, thread_ids, status, user_id=user_id)
+
+
+def with_thread_status(rows: Iterable[tuple[str, str, str]], status: str) -> list[tuple[str, str, str, str]]:
+    """``end_preempted_runs`` rows tagged with the thread status ``settle_threads_of`` should apply."""
+    return [(run_id, thread_id, user_id, status) for run_id, thread_id, user_id in rows]
+
+
+async def end_preempted_runs(session: AsyncSession, *where: ColumnElement[bool]) -> list[tuple[str, str, str]]:
+    """End the pre-empted (stamped) runs matching ``where`` as ``interrupted`` with their lease cleared.
+    Returns their ``(run_id, thread_id, user_id)``; the caller commits, then settles the threads."""
+    result = await session.execute(
+        update(RunORM)
+        .where(interrupt_requested_expr().isnot(None), *where)
+        .values(status="interrupted", claimed_by=None, lease_expires_at=None, updated_at=datetime.now(UTC))
+        .returning(RunORM.run_id, RunORM.thread_id, RunORM.user_id)
+    )
+    return [(run_id, thread_id, user_id) for run_id, thread_id, user_id in result.all()]
+
+
+async def finalize_overdue_preemptions(session: AsyncSession) -> list[tuple[str, str]]:
+    """End pre-empted runs still ``running`` past MULTITASK_PREEMPT_TIMEOUT_SECONDS as ``interrupted``,
+    so a task that ignores cancellation cannot hold its thread forever. Returns (run_id, thread_id)."""
+    cutoff = datetime.now(UTC) - timedelta(seconds=settings.multitask.MULTITASK_PREEMPT_TIMEOUT_SECONDS)
+    rows = await end_preempted_runs(
+        session,
+        RunORM.status == "running",
+        interrupt_requested_expr().cast(TIMESTAMP(timezone=True)) < cutoff,
+    )
+    if not rows:
+        return []
+    # Run rows first, thread rows in a second transaction: the gate and finalize lock thread-then-run.
+    await session.commit()
+    await settle_threads_of(session, with_thread_status(rows, "idle"))
+    await session.commit()
+    logger.warning("Pre-empted runs ignored cancellation past the timeout", run_ids=[row[0] for row in rows])
+    return [(run_id, thread_id) for run_id, thread_id, _user_id in rows]
 
 
 def queued_threads_stmt() -> Select[tuple[str]]:

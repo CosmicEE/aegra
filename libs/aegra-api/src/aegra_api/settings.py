@@ -481,6 +481,9 @@ class MultitaskSettings(EnvBase):
 
     # Default matches LangGraph Platform: fresh input on a paused thread is admitted.
     MULTITASK_PAUSED_THREAD_POLICY: Literal["reject", "admit"] = "admit"
+    # A pre-empted run whose task ignores the cancel this long is interrupted by the recovery sweeps
+    # so its thread (and the queue behind it) is not held forever; must exceed the worker heartbeat (Settings).
+    MULTITASK_PREEMPT_TIMEOUT_SECONDS: int = Field(default=60, gt=0)
 
 
 class Settings:
@@ -495,6 +498,12 @@ class Settings:
         self.redis = RedisSettings()
         self.worker = WorkerSettings()
         self.multitask = MultitaskSettings()
+        if self.multitask.MULTITASK_PREEMPT_TIMEOUT_SECONDS <= self.worker.HEARTBEAT_INTERVAL_SECONDS:
+            raise ValueError(
+                f"MULTITASK_PREEMPT_TIMEOUT_SECONDS ({self.multitask.MULTITASK_PREEMPT_TIMEOUT_SECONDS}) must be "
+                f"greater than HEARTBEAT_INTERVAL_SECONDS ({self.worker.HEARTBEAT_INTERVAL_SECONDS}): the owning "
+                "worker needs a heartbeat to deliver the cancel before a pre-empted run is cut loose."
+            )
         self.cron = CronSettings()
         self.thread_ttl = ThreadTTLSettings()
         self.checkpointer = CheckpointerSettings()

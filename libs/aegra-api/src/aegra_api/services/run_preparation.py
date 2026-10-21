@@ -30,7 +30,13 @@ from aegra_api.models.run_job import RunBehavior, RunExecution, RunIdentity, Run
 from aegra_api.models.runs import Durability
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
-from aegra_api.services.run_status import ACTIVE_RUN_STATES, QUEUED_RUN_STATE, has_live_executor, set_thread_status
+from aegra_api.services.run_status import (
+    ACTIVE_RUN_STATES,
+    QUEUED_RUN_STATE,
+    has_live_executor,
+    mark_interrupt_requested,
+    set_thread_status,
+)
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.settings import settings
 from aegra_api.utils.assistants import resolve_assistant_id
@@ -364,8 +370,9 @@ async def _apply_multitask_strategy(
         if strategy == "rollback" and rollback_target is None:
             rollback_target = run.run_id
         if run.status == "running" and has_live_executor(run, now=now):
-            # Its task keeps the row ``running`` until it has exited (its own finalize writes
-            # ``interrupted``), so nothing can promote onto the thread while it still writes.
+            # Its row stays ``running`` until its task has exited (own finalize writes ``interrupted``);
+            # the stamp outlives a lost pub/sub cancel: heartbeat, reaper, drain and sweep honour it.
+            mark_interrupt_requested(run, now=now)
             wait_for_running = True
             continue
         # Never started (its start CAS fails once this commits) or its executor is gone:

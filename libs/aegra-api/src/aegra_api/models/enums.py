@@ -1,6 +1,6 @@
 """Status enums for Aegra API specification."""
 
-from typing import Literal
+from typing import Literal, get_args
 
 # Run status enum (API wire vocabulary — matches the LangGraph SDK). The internal
 # double-texting park state 'queued' is persisted-only and reported as 'pending'.
@@ -32,5 +32,6 @@ MultitaskStrategy = Literal[
 # Applied when a run is created without an explicit multitask_strategy.
 # Matches LangGraph Platform's documented default (enqueue).
 MULTITASK_DEFAULT: MultitaskStrategy = "enqueue"
+MULTITASK_STRATEGIES: frozenset[str] = frozenset(get_args(MultitaskStrategy))
 
 RunCancellationAction = Literal["cancel", "interrupt"]

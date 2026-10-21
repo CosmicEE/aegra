@@ -144,8 +144,12 @@ async def test_interrupt_cancels_active_e2e() -> None:
         b = await client.post(f"/threads/{tid}/runs", json=_body(aid, "interrupt"))
         b.raise_for_status()
 
+        # The strategy is part of the Run record (SDK Run type), on creation and on read-back.
+        assert a.json()["multitask_strategy"] == "enqueue" and b.json()["multitask_strategy"] == "interrupt"
         assert await _wait_terminal(client, tid, rid_a) == "interrupted"
         assert await _wait_terminal(client, tid, b.json()["run_id"]) == "success"
+        read_back = await client.get(f"/threads/{tid}/runs/{b.json()['run_id']}")
+        assert read_back.json()["multitask_strategy"] == "interrupt"
 
 
 @pytest.mark.e2e

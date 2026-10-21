@@ -36,6 +36,7 @@ def _fake_run(run_id: str = "run-1", status: str = "running", *, live: bool = Fa
     run = MagicMock()
     run.run_id = run_id
     run.status = status
+    run.execution_params = {}
     run.claimed_by = "worker-1" if live else None
     run.lease_expires_at = datetime.now(UTC) + timedelta(minutes=5) if live else None
     return run
@@ -1044,6 +1045,9 @@ class TestGatePreemptionOccupancy:
         assert cancel_ids == ["run-1"]  # the stop request goes through the broker
         assert active.status == "running"
         assert active.claimed_by == "worker-1"
+        # The row remembers the pre-emption, so heartbeat / reaper / drain end it as interrupted
+        # even if the pub/sub cancel never arrives.
+        assert "_interrupt_requested_at" in active.execution_params
 
     @pytest.mark.asyncio
     async def test_expired_lease_run_is_interrupted_in_place(self) -> None:

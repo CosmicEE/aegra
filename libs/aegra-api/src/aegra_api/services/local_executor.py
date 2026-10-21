@@ -20,7 +20,15 @@ from aegra_api.core.orm import _get_session_maker
 from aegra_api.models.run_job import RunJob
 from aegra_api.observability.span_enrichment import make_run_trace_context
 from aegra_api.services.base_executor import BaseExecutor
-from aegra_api.services.run_status import ACTIVE_RUN_STATES, QUEUED_RUN_STATE, get_run_status, queued_threads_stmt
+from aegra_api.services.run_status import (
+    ACTIVE_RUN_STATES,
+    QUEUED_RUN_STATE,
+    end_preempted_runs,
+    finalize_overdue_preemptions,
+    get_run_status,
+    interrupt_requested_expr,
+    queued_threads_stmt,
+)
 
 logger = structlog.getLogger(__name__)
 
@@ -107,6 +115,12 @@ class LocalExecutor(BaseExecutor):
         """Re-dispatch every thread holding a queued run (a no-op when one is occupying)."""
         maker = _get_session_maker()
         async with maker() as session:
+            # A pre-empted task that ignored its cancel is cut loose after the timeout: its row ends
+            # interrupted here and its thread is promoted below like any other stranded queue.
+            for run_id, _thread_id in await finalize_overdue_preemptions(session):
+                task = active_runs.get(run_id)
+                if task is not None and not task.done():
+                    task.cancel()
             threads = {row[0] for row in (await session.execute(queued_threads_stmt())).all()}
         for thread_id in threads:
             # Per-thread isolation: one bad row must not abort recovery for the rest.
@@ -142,25 +156,25 @@ class LocalExecutor(BaseExecutor):
         for thread_id in threads:
             try:
                 async with maker() as session:
+                    now = datetime.now(UTC)
+                    orphaned = (RunORM.thread_id == thread_id, RunORM.status.in_(ACTIVE_RUN_STATES))
+                    # A pre-empted orphan ends interrupted, as the worker-mode reaper and drain end it.
+                    preempted = await end_preempted_runs(session, *orphaned)
                     result = cast(
                         CursorResult[Any],
                         await session.execute(
                             update(RunORM)
-                            .where(RunORM.thread_id == thread_id, RunORM.status.in_(("running", "pending")))
-                            .values(
-                                status="error",
-                                error_message="Orphaned by server restart",
-                                updated_at=datetime.now(UTC),
-                            )
+                            .where(*orphaned, interrupt_requested_expr().is_(None))
+                            .values(status="error", error_message="Orphaned by server restart", updated_at=now)
                         ),
                     )
-                    if result.rowcount > 0:
-                        # The orphans' finalizes never ran: reset the thread as an error finalize
-                        # would. Queued-only threads match nothing here, preserving a HITL pause.
+                    if result.rowcount > 0 or preempted:
+                        # The orphans' finalizes never ran: reset the thread as their finalize would.
+                        # Queued-only threads match nothing here, preserving a HITL pause.
                         await session.execute(
                             update(ThreadORM)
                             .where(ThreadORM.thread_id == thread_id)
-                            .values(status="error", updated_at=datetime.now(UTC))
+                            .values(status="error" if result.rowcount > 0 else "idle", updated_at=now)
                         )
                     await session.commit()
                 await self.dispatch_next_for_thread(thread_id)

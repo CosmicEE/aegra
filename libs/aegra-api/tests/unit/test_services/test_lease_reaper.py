@@ -23,6 +23,13 @@ def _make_session_maker(session: AsyncMock) -> MagicMock:
     return maker
 
 
+@pytest.fixture(autouse=True)
+def _no_overdue_preemptions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_reap also sweeps pre-empted runs past their timeout; that path has its own tests in
+    test_run_status, keep it off the mocked sessions here."""
+    monkeypatch.setattr(LeaseReaper, "_finalize_overdue_preemptions", AsyncMock(return_value=[]))
+
+
 class TestFindRecoverable:
     @pytest.mark.asyncio
     async def test_returns_crashed_and_stuck_separately(self) -> None:
@@ -91,7 +98,7 @@ class TestRecoverCrashedRuns:
         updated_run_1.scalar_one_or_none.return_value = "run-1"
         updated_run_2 = MagicMock()
         updated_run_2.scalar_one_or_none.return_value = "run-2"
-        session.execute = AsyncMock(side_effect=[locked, updated_run_1, updated_run_2])
+        session.execute = AsyncMock(side_effect=[locked, updated_run_1, updated_run_2, MagicMock()])  # + thread lock
         session.commit = AsyncMock()
         maker = _make_session_maker(session)
 
@@ -99,7 +106,7 @@ class TestRecoverCrashedRuns:
             patch("aegra_api.services.lease_reaper._get_session_maker", return_value=maker),
             patch("aegra_api.services.lease_reaper.settings") as mock_settings,
             patch(
-                "aegra_api.services.lease_reaper.set_thread_status_if_no_active_runs",
+                "aegra_api.services.run_status.set_thread_status_if_no_active_runs",
                 new_callable=AsyncMock,
             ) as mock_set_thread,
         ):
@@ -108,12 +115,50 @@ class TestRecoverCrashedRuns:
 
         assert retryable == ["run-1"]
         assert exhausted == ["run-2"]
-        for call in session.execute.await_args_list[1:]:
+        for call in session.execute.await_args_list[1:3]:  # the two run UPDATEs (the thread lock follows)
             compiled = call.args[0].compile()
             assert "runs.user_id" in str(compiled)
         mock_set_thread.assert_awaited_once_with(session, {"thread-2"}, "error", user_id="user-2")
         assert session.commit.await_count == 2
         assert maker.call_count == 2  # a fresh transaction for the thread rows
+
+    @pytest.mark.asyncio
+    async def test_preempted_run_ends_interrupted_without_a_retry(self) -> None:
+        # Its worker died after a double-text replaced it: requeueing would run it again ahead
+        # of the replacement, so the reaper finalizes it instead and frees the thread.
+        session = AsyncMock()
+        locked = MagicMock()
+        locked.fetchall.return_value = [
+            (
+                "run-pre",
+                "thread-1",
+                "user-1",
+                {"_retry_count": 0, "_interrupt_requested_at": "2026-10-19T00:00:00+00:00"},
+            ),
+        ]
+        updated = MagicMock()
+        updated.scalar_one_or_none.return_value = "run-pre"
+        session.execute = AsyncMock(side_effect=[locked, updated, MagicMock()])  # + thread lock
+        session.commit = AsyncMock()
+        maker = _make_session_maker(session)
+
+        with (
+            patch("aegra_api.services.lease_reaper._get_session_maker", return_value=maker),
+            patch("aegra_api.services.lease_reaper.settings") as mock_settings,
+            patch(
+                "aegra_api.services.run_status.set_thread_status_if_no_active_runs",
+                new_callable=AsyncMock,
+            ) as mock_set_thread,
+        ):
+            mock_settings.worker.BG_JOB_MAX_RETRIES = 3
+            retryable, exhausted = await LeaseReaper._recover_crashed_runs(["run-pre"])
+
+        assert retryable == [] and exhausted == []  # neither retried nor counted as a failure
+        update_stmt = session.execute.await_args_list[1].args[0]
+        values = update_stmt.compile().params
+        assert values["status"] == "interrupted"
+        assert values["execution_params"]["_retry_count"] == 0  # no retry budget charged
+        mock_set_thread.assert_awaited_once_with(session, {"thread-1"}, "idle", user_id="user-1")
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_rows_are_no_longer_expired(self) -> None:
@@ -148,7 +193,7 @@ class TestRecoverCrashedRuns:
             patch("aegra_api.services.lease_reaper._get_session_maker", return_value=maker),
             patch("aegra_api.services.lease_reaper.settings") as mock_settings,
             patch(
-                "aegra_api.services.lease_reaper.set_thread_status_if_no_active_runs",
+                "aegra_api.services.run_status.set_thread_status_if_no_active_runs",
                 new_callable=AsyncMock,
             ) as mock_set_thread,
         ):
@@ -297,6 +342,32 @@ class TestReap:
 
         mock_recover.assert_not_awaited()
         mock_reenqueue.assert_awaited_once_with(["run-3"])
+
+    @pytest.mark.asyncio
+    async def test_overdue_preemptions_are_swept_before_the_stranded_scan(self) -> None:
+        # A run cut loose by the timeout frees its thread; the scan in the same cycle must see that
+        # and promote the parked replacement, and the cut-loose run is counted.
+        reaper = LeaseReaper()
+        order: list[str] = []
+
+        async def _sweep() -> list[tuple[str, str]]:
+            order.append("sweep")
+            return [("run-9", "thread-9")]
+
+        async def _scan() -> list[str]:
+            order.append("scan")
+            return []
+
+        before = _recovered_count("preempt_timeout")
+        with (
+            patch.object(LeaseReaper, "_find_recoverable", new_callable=AsyncMock, return_value=([], [])),
+            patch.object(LeaseReaper, "_finalize_overdue_preemptions", side_effect=_sweep),
+            patch.object(LeaseReaper, "_find_stranded_queued_threads", side_effect=_scan),
+        ):
+            await reaper._reap()
+
+        assert order == ["sweep", "scan"]
+        assert _recovered_count("preempt_timeout") == before + 1
 
     @pytest.mark.asyncio
     async def test_skips_when_nothing_to_recover(self) -> None:

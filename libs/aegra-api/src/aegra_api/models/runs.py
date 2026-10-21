@@ -13,7 +13,7 @@ from pydantic import (
     model_validator,
 )
 
-from aegra_api.models.enums import MultitaskStrategy
+from aegra_api.models.enums import MULTITASK_DEFAULT, MultitaskStrategy
 from aegra_api.utils.status_compat import validate_run_status
 
 # Constraints for ``RunCreate.metadata`` keys/values, enforced at request
@@ -222,6 +222,9 @@ class Run(BaseModel):
     user_id: str = Field(..., description="Identifier of the user who owns this run.")
     created_at: datetime = Field(..., description="Timestamp when the run was created.")
     updated_at: datetime = Field(..., description="Timestamp when the run was last updated.")
+    multitask_strategy: MultitaskStrategy = Field(
+        MULTITASK_DEFAULT, description="How the run was admitted against the thread's other runs (see RunCreate)."
+    )
 
     @field_validator("status", mode="before")
     @classmethod
