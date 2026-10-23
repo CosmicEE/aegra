@@ -91,7 +91,9 @@ immediately.
   `GET /threads/{id}/history` shows both branches while `state` returns the new
   clean head. The fork point is resolved by lineage — the parent of the rolled-back
   run's oldest checkpoint, found through the checkpointer's `run_id` metadata filter,
-  so the length of the thread's history does not matter. Only an in-flight run is
+  so the length of the thread's history does not matter. The fork happens once: a
+  rollback run retried after a worker crash or drain resumes from its own last
+  checkpoint instead of forking again. Only an in-flight run is
   ever reverted: on an *idle* thread `rollback` starts the new run on the current
   state like `enqueue` would, even if the last run ended `interrupted` or `error`
   (LangGraph Platform behaves the same). Caveat: if the rolled-back run was the

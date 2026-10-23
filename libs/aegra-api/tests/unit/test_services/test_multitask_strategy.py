@@ -19,7 +19,7 @@ from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.models.auth import User
 from aegra_api.services import run_preparation as run_preparation_mod
 from aegra_api.services.base_executor import BaseExecutor
-from aegra_api.services.run_executor import _resolve_rollback_base, _rollback_fork_base
+from aegra_api.services.run_executor import _has_own_checkpoints, _resolve_rollback_base, _rollback_fork_base
 from aegra_api.services.run_preparation import (
     _apply_multitask_strategy,
     _validate_resume_command,
@@ -609,9 +609,15 @@ class _FakeSnap:
 def _history(*snaps: _FakeSnap) -> MagicMock:
     """A graph whose checkpointer lists ``snaps`` (newest first) honouring the metadata ``filter``."""
 
-    async def _alist(config: object, *, filter: dict[str, Any] | None = None) -> AsyncIterator[_FakeSnap]:
+    async def _alist(
+        config: object, *, filter: dict[str, Any] | None = None, limit: int | None = None
+    ) -> AsyncIterator[_FakeSnap]:
+        yielded = 0
         for s in snaps:
+            if limit is not None and yielded >= limit:
+                return
             if filter is None or all(s.metadata.get(k) == v for k, v in filter.items()):
+                yielded += 1
                 yield s
 
     graph = MagicMock()
@@ -733,6 +739,26 @@ class TestRollbackForkBase:
             patch("aegra_api.services.run_executor.create_thread_config", return_value={"configurable": {}}),
         ):
             assert await _rollback_fork_base(graph, self._job()) == "cp-prev"
+
+
+class TestRollbackRetry:
+    """Only a rollback run's first attempt forks; a retry (worker crash, drain) resumes its own checkpoints."""
+
+    @pytest.mark.asyncio
+    async def test_first_attempt_has_no_checkpoints_of_its_own(self) -> None:
+        graph = _history(_FakeSnap("target", "cp-1", parent_checkpoint_id="cp-0"))
+        with patch("aegra_api.services.run_executor.create_thread_config", return_value={"configurable": {}}):
+            assert await _has_own_checkpoints(graph, TestRollbackForkBase._job()) is False
+
+    @pytest.mark.asyncio
+    async def test_retry_finds_its_own_checkpoint(self) -> None:
+        # The first attempt forked from cp-0 and wrote cp-2 before its worker died: resume there.
+        graph = _history(
+            _FakeSnap("new", "cp-2", parent_checkpoint_id="cp-0"),
+            _FakeSnap("target", "cp-1", parent_checkpoint_id="cp-0"),
+        )
+        with patch("aegra_api.services.run_executor.create_thread_config", return_value={"configurable": {}}):
+            assert await _has_own_checkpoints(graph, TestRollbackForkBase._job()) is True
 
 
 def _session_with_thread(status: str | None) -> AsyncMock:

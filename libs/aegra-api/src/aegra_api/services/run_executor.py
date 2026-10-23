@@ -216,7 +216,13 @@ async def _stream_graph(job: RunJob) -> _GraphResult:
         # Fork from the checkpoint preceding the target run so its writes are reverted and the
         # graph re-enters via __start__; no checkpoints are deleted.
         if job.execution.rollback_target_run_id and not run_config.get("configurable", {}).get("checkpoint_id"):
-            base = await _rollback_fork_base(graph, job)
+            if await _has_own_checkpoints(graph, job):
+                # A retry (worker crash, drain): resume from this run's own last checkpoint; forking
+                # again would discard that progress and leave the first attempt as a dead branch.
+                logger.info("Rollback run retried; resuming from its own checkpoints", run_id=job.identity.run_id)
+                base = None
+            else:
+                base = await _rollback_fork_base(graph, job)
             if base is not None:
                 run_config.setdefault("configurable", {})["checkpoint_id"] = base
                 logger.info(
@@ -334,6 +340,15 @@ async def _rollback_fork_base(graph: Any, job: RunJob) -> str | None:
         )
         return None
     return await _resolve_rollback_base(graph, job.identity.thread_id, job.user, target_run_id)
+
+
+async def _has_own_checkpoints(graph: Any, job: RunJob) -> bool:
+    """Whether this run already wrote checkpoints on its thread, i.e. it is being retried."""
+    history_config = create_thread_config(job.identity.thread_id, job.user)
+    history_config.setdefault("configurable", {})["checkpoint_ns"] = ""
+    async for _checkpoint in graph.checkpointer.alist(history_config, filter={"run_id": job.identity.run_id}, limit=1):
+        return True
+    return False
 
 
 async def _resolve_rollback_base(graph: Any, thread_id: str, user: User, target_run_id: str) -> str | None:
