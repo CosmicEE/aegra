@@ -23,11 +23,34 @@ def _make_session_maker(session: AsyncMock) -> MagicMock:
     return maker
 
 
+# Captured before the autouse stub below replaces it, so the wrapper itself can be tested.
+_REAL_OVERDUE_SWEEP = LeaseReaper._finalize_overdue_preemptions
+
+
 @pytest.fixture(autouse=True)
 def _no_overdue_preemptions(monkeypatch: pytest.MonkeyPatch) -> None:
     """_reap also sweeps pre-empted runs past their timeout; that path has its own tests in
     test_run_status, keep it off the mocked sessions here."""
     monkeypatch.setattr(LeaseReaper, "_finalize_overdue_preemptions", AsyncMock(return_value=[]))
+
+
+class TestOverdueSweepWrapper:
+    @pytest.mark.asyncio
+    async def test_runs_the_shared_sweep_on_a_fresh_session(self) -> None:
+        session = AsyncMock()
+        maker = _make_session_maker(session)
+
+        with (
+            patch("aegra_api.services.lease_reaper._get_session_maker", return_value=maker),
+            patch(
+                "aegra_api.services.lease_reaper.finalize_overdue_preemptions",
+                new_callable=AsyncMock,
+                return_value=[("run-1", "thread-1")],
+            ) as sweep,
+        ):
+            assert await _REAL_OVERDUE_SWEEP() == [("run-1", "thread-1")]
+
+        sweep.assert_awaited_once_with(session)
 
 
 class TestFindRecoverable:
@@ -118,7 +141,9 @@ class TestRecoverCrashedRuns:
         for call in session.execute.await_args_list[1:3]:  # the two run UPDATEs (the thread lock follows)
             compiled = call.args[0].compile()
             assert "runs.user_id" in str(compiled)
-        mock_set_thread.assert_awaited_once_with(session, {"thread-2"}, "error", user_id="user-2")
+        mock_set_thread.assert_awaited_once_with(
+            session, {"thread-2"}, "error", user_id="user-2", only_if_status="busy"
+        )
         assert session.commit.await_count == 2
         assert maker.call_count == 2  # a fresh transaction for the thread rows
 
@@ -158,7 +183,7 @@ class TestRecoverCrashedRuns:
         values = update_stmt.compile().params
         assert values["status"] == "interrupted"
         assert values["execution_params"]["_retry_count"] == 0  # no retry budget charged
-        mock_set_thread.assert_awaited_once_with(session, {"thread-1"}, "idle", user_id="user-1")
+        mock_set_thread.assert_awaited_once_with(session, {"thread-1"}, "idle", user_id="user-1", only_if_status="busy")
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_rows_are_no_longer_expired(self) -> None:

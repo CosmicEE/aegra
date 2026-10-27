@@ -254,6 +254,19 @@ class TestSetThreadStatusIfNoActiveRuns:
 
         session.execute.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_only_if_status_leaves_a_thread_that_moved_on(self) -> None:
+        # Recovery settles threads in a second transaction; a newer run may have paused the thread
+        # in between, and its ``interrupted`` must survive the old run's ``idle``.
+        session = _make_mock_session()
+
+        await set_thread_status_if_no_active_runs(
+            session, ["thread-1"], "idle", user_id="user-1", only_if_status="busy"
+        )
+
+        sql = str(session.execute.await_args.args[0].compile(compile_kwargs={"literal_binds": True}))
+        assert "thread.status = 'busy'" in sql
+
 
 class TestInterruptUnownedRun:
     @pytest.mark.asyncio
@@ -429,7 +442,7 @@ class TestPreemptionStamp:
         assert "'interrupted'" in sql
         lock_sql = str(session.execute.await_args_list[1].args[0].compile(dialect=postgresql.dialect()))
         assert "FOR UPDATE" in lock_sql and "ORDER BY thread.thread_id" in lock_sql  # thread rows locked first
-        mock_thread.assert_awaited_once_with(session, {"thread-1"}, "idle", user_id="user-1")
+        mock_thread.assert_awaited_once_with(session, {"thread-1"}, "idle", user_id="user-1", only_if_status="busy")
         assert session.commit.await_count == 2  # run rows first, thread rows in a second transaction
 
     @pytest.mark.asyncio

@@ -70,7 +70,9 @@ async def settle_threads_of(session: AsyncSession, ended: Iterable[tuple[str, st
         .with_for_update()
     )
     for (user_id, status), thread_ids in threads_by_target.items():
-        await set_thread_status_if_no_active_runs(session, thread_ids, status, user_id=user_id)
+        # Only a thread still ``busy`` from the ended run: a newer run may have finished or paused it
+        # since the run rows committed, and that later status must not be overwritten.
+        await set_thread_status_if_no_active_runs(session, thread_ids, status, user_id=user_id, only_if_status="busy")
 
 
 def with_thread_status(rows: Iterable[tuple[str, str, str]], status: str) -> list[tuple[str, str, str, str]]:
@@ -183,11 +185,13 @@ async def set_thread_status_if_no_active_runs(
     status: str,
     *,
     user_id: str,
+    only_if_status: str | None = None,
 ) -> None:
     """Update threads that no longer have a pending or running run.
 
     Does not commit so callers can keep the run and thread transitions in
-    one transaction. Queued runs hold no task, so they do not count.
+    one transaction. Queued runs hold no task, so they do not count. With
+    ``only_if_status``, a thread whose status has moved on since is left alone.
     """
     if not thread_ids:
         return
@@ -202,15 +206,10 @@ async def set_thread_status_if_no_active_runs(
         )
         .correlate(ThreadORM)
     )
-    await session.execute(
-        update(ThreadORM)
-        .where(
-            ThreadORM.thread_id.in_(thread_ids),
-            ThreadORM.user_id == user_id,
-            ~active_run_exists,
-        )
-        .values(status=validated, updated_at=datetime.now(UTC))
-    )
+    conditions = [ThreadORM.thread_id.in_(thread_ids), ThreadORM.user_id == user_id, ~active_run_exists]
+    if only_if_status is not None:
+        conditions.append(ThreadORM.status == validate_thread_status(only_if_status))
+    await session.execute(update(ThreadORM).where(*conditions).values(status=validated, updated_at=datetime.now(UTC)))
 
 
 async def _lock_thread_row(session: AsyncSession, thread_id: str) -> None:

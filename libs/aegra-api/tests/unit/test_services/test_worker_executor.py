@@ -1104,9 +1104,14 @@ class TestRequeueDrainedRuns:
         interrupt_sql = str(session.execute.await_args_list[0].args[0].compile(compile_kwargs={"literal_binds": True}))
         assert "'interrupted'" in interrupt_sql and "_interrupt_requested_at" in interrupt_sql
         assert "updated_at=" in interrupt_sql
-        requeue_sql = str(session.execute.await_args_list[1].args[0].compile(compile_kwargs={"literal_binds": True}))
-        assert "IS NULL" in requeue_sql  # only never-pre-empted rows go back to the queue
-        mock_thread.assert_awaited_once_with(session, {"thread-1"}, "idle", user_id="user-1")
+        requeue_sql = str(
+            session.execute.await_args_list[1]
+            .args[0]
+            .compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+        )
+        # Only never-pre-empted rows go back to the queue.
+        assert "->> '_interrupt_requested_at') IS NULL" in requeue_sql
+        mock_thread.assert_awaited_once_with(session, {"thread-1"}, "idle", user_id="user-1", only_if_status="busy")
         mock_redis.get_client.assert_not_called()
 
 

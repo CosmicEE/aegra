@@ -10,8 +10,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import structlog
-from sqlalchemy import CursorResult, select, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import CursorResult, and_, or_, select, update
 
 from aegra_api.core.active_runs import active_runs
 from aegra_api.core.orm import Run as RunORM
@@ -28,6 +27,7 @@ from aegra_api.services.run_status import (
     get_run_status,
     interrupt_requested_expr,
     queued_threads_stmt,
+    set_thread_status_if_no_active_runs,
 )
 
 logger = structlog.getLogger(__name__)
@@ -44,6 +44,11 @@ async def _is_run_terminal(run_id: str) -> bool:
 
 class LocalExecutor(BaseExecutor):
     """Runs graphs as local asyncio tasks (single-instance dev mode)."""
+
+    # Set by start(): runs last written before it belong to the previous process. Until one
+    # orphan-recovery pass has succeeded, the periodic sweep retries it.
+    _started_at: datetime | None = None
+    _orphans_recovered: bool = True
 
     async def submit(self, job: RunJob) -> None:
         # Deferred import: run_executor imports services that reference
@@ -90,8 +95,9 @@ class LocalExecutor(BaseExecutor):
 
     async def start(self) -> None:
         self._accepting = True
+        self._started_at = datetime.now(UTC)
         logger.info("Local executor started (in-process asyncio tasks)")
-        await self._recover_orphaned_queue()
+        self._orphans_recovered = await self._recover_orphaned_queue()
         self._sweep_task = asyncio.create_task(self._stranded_queue_loop())
 
     async def _stranded_queue_loop(self) -> None:
@@ -107,9 +113,15 @@ class LocalExecutor(BaseExecutor):
             # Catch-all (like the prod reaper's loop) so a corrupt-params row or any other
             # non-SQLAlchemyError cannot permanently kill the periodic recovery task.
             try:
-                await self._sweep_stranded_queues()
+                await self._sweep_once()
             except Exception:
                 logger.exception("Stranded-queue sweep failed")
+
+    async def _sweep_once(self) -> None:
+        """One periodic pass: finish a startup orphan recovery that failed, then the stranded queues."""
+        if not self._orphans_recovered:
+            self._orphans_recovered = await self._recover_orphaned_queue()
+        await self._sweep_stranded_queues()
 
     async def _sweep_stranded_queues(self) -> None:
         """Re-dispatch every thread holding a queued run (a no-op when one is occupying)."""
@@ -129,9 +141,14 @@ class LocalExecutor(BaseExecutor):
             except Exception:
                 logger.exception("Stranded-queue dispatch failed", thread_id=thread_id)
 
-    async def _recover_orphaned_queue(self) -> None:
-        """Fail runs orphaned by the previous process (a fresh process has no live tasks) and
-        dispatch the next queued run on each affected thread."""
+    async def _recover_orphaned_queue(self) -> bool:
+        """Fail runs orphaned by the previous process and dispatch the next queued run on each
+        affected thread. Returns whether every step succeeded, so the periodic sweep can retry."""
+        # The previous process's runs: last written before this one started, with no task here.
+        orphan = [RunORM.status.in_(ACTIVE_RUN_STATES), RunORM.updated_at < (self._started_at or datetime.now(UTC))]
+        local_ids = [run_id for run_id, task in active_runs.items() if not task.done()]
+        if local_ids:
+            orphan.append(RunORM.run_id.notin_(local_ids))
         maker = _get_session_maker()
         try:
             async with maker() as session:
@@ -140,24 +157,33 @@ class LocalExecutor(BaseExecutor):
                     for row in (
                         await session.execute(
                             select(RunORM.thread_id)
-                            .where(RunORM.status.in_((*ACTIVE_RUN_STATES, QUEUED_RUN_STATE)))
+                            .where(or_(and_(*orphan), RunORM.status == QUEUED_RUN_STATE))
                             .distinct()
                         )
                     ).all()
                 }
-        except SQLAlchemyError:
-            # Recovery is best effort: the periodic sweep retries, and startup must not depend on it.
+        except Exception:
+            # Best effort: the periodic sweep retries until one pass succeeds; startup must not wait on it.
             logger.exception("Could not scan for runs orphaned by the previous process")
-            return
+            return False
         if not threads:
-            return
+            return True
 
         logger.warning("Recovering threads after restart", thread_count=len(threads))
+        recovered = True
         for thread_id in threads:
             try:
                 async with maker() as session:
+                    # Thread row first, the gate's lock order: a retry runs while requests are served.
+                    owner = (
+                        await session.execute(
+                            select(ThreadORM.thread_id, ThreadORM.user_id)
+                            .where(ThreadORM.thread_id == thread_id)
+                            .with_for_update()
+                        )
+                    ).first()
                     now = datetime.now(UTC)
-                    orphaned = (RunORM.thread_id == thread_id, RunORM.status.in_(ACTIVE_RUN_STATES))
+                    orphaned = (RunORM.thread_id == thread_id, *orphan)
                     # A pre-empted orphan ends interrupted, as the worker-mode reaper and drain end it.
                     preempted = await end_preempted_runs(session, *orphaned)
                     result = cast(
@@ -168,18 +194,23 @@ class LocalExecutor(BaseExecutor):
                             .values(status="error", error_message="Orphaned by server restart", updated_at=now)
                         ),
                     )
-                    if result.rowcount > 0 or preempted:
-                        # The orphans' finalizes never ran: reset the thread as their finalize would.
-                        # Queued-only threads match nothing here, preserving a HITL pause.
-                        await session.execute(
-                            update(ThreadORM)
-                            .where(ThreadORM.thread_id == thread_id)
-                            .values(status="error" if result.rowcount > 0 else "idle", updated_at=now)
+                    if owner is not None and (result.rowcount > 0 or preempted):
+                        # The orphans' finalizes never ran: settle the thread as they would, only while it
+                        # is still busy from them. Queued-only threads match nothing here, keeping a pause.
+                        await set_thread_status_if_no_active_runs(
+                            session,
+                            [thread_id],
+                            "error" if result.rowcount > 0 else "idle",
+                            user_id=owner.user_id,
+                            only_if_status="busy",
                         )
                     await session.commit()
                 await self.dispatch_next_for_thread(thread_id)
-            except SQLAlchemyError:
+            except Exception:
+                # Per-thread isolation, as in the sweep: one bad thread must not abort the others.
+                recovered = False
                 logger.exception("Failed to recover thread after restart", thread_id=thread_id)
+        return recovered
 
     async def stop(self) -> None:
         # No new promotions past this point, and any in-flight one has submitted
