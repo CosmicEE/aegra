@@ -191,7 +191,7 @@ When a worker crashes (OOM, kill signal, network partition), its heartbeat stops
 The reaper resets the run to `pending` and re-enqueues it.
 The new worker resumes from the last checkpoint.
 A run created with `durability="exit"` writes no checkpoints until it ends, so it starts over from the thread's state before the run (see [checkpoint durability](/guides/threads-and-state#checkpoint-durability)).
-Once retries are exhausted, the reaper marks the run `error`, clears ownership, and marks the thread `error` in the same transaction when no other run is active.
+Once retries are exhausted, the reaper marks the run `error` and clears ownership, then in a second transaction marks the thread `error` if no other run is active and the thread is still `busy` from that run.
 A run that a double-text had already pre-empted (see [double-texting](/guides/double-texting)) is never retried: the reaper ends it `interrupted` without charging a retry.
 It ends a pre-empted run the same way when its task ignores the cancel past `MULTITASK_PREEMPT_TIMEOUT_SECONDS`.
 

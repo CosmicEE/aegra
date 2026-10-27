@@ -56,7 +56,7 @@ Over the API a parked run is reported as `pending` — the LangGraph SDK's run-s
 vocabulary has no `queued` value, and LangGraph Platform reports enqueued
 double-texts the same way, so typed clients (Studio, Agent Chat UI, the JS SDK)
 see only standard statuses. Poll or stream it like any other run; on the wire it
-transitions `pending → running → success` (or `error`/`interrupted`). A later
+transitions `pending → running → success` (or `error`/`interrupted`/`timeout`). A later
 `interrupt` or `rollback` run admitted while this one is still parked *drops* it
 (marks it `interrupted` and ends any stream attached to it) instead of running it
 afterward — those strategies abandon all in-flight work, including earlier
@@ -122,7 +122,8 @@ immediately.
   `POST /runs/cancel` (the SDK's `cancel_many`; its `pending` selector includes
   parked runs), force-delete and disconnect-cancel all handle a still-`queued` run by
   dropping it in place: it becomes `interrupted` without touching the thread, and
-  anything parked behind it is promoted at once. A run that was promoted in the
+  the runs parked behind it keep their order (the thread's queue is re-dispatched,
+  which starts the next one only once the thread is free). A run that was promoted in the
   meantime is cancelled like any other active run. Every path that frees a thread —
   a run's own finalize, a cancel, a force-delete — dispatches that thread's next
   queued run, so a cancelled head never strands the queue; it does so only once
@@ -135,7 +136,10 @@ immediately.
 - **Crash recovery.** Queued runs are durable in Postgres. In worker mode the
   lease reaper re-dispatches a thread whose queue was stranded by a lost wakeup;
   in dev mode (`LocalExecutor`) the same recovery runs on startup and via a periodic
-  ~30s sweep, so a stranded dev queue self-heals without a restart. A run finalizing
+  ~30s sweep, so a stranded dev queue self-heals without a restart. On startup, dev
+  mode also ends the previous process's in-flight runs (`error`, or `interrupted` for
+  one a double-text had pre-empted) and frees their threads; if the database was
+  unavailable at that moment, the sweep retries until one pass succeeds. A run finalizing
   during shutdown does not dispatch the next queued run — it is picked up by the next
   start or sweep instead.
 - **Both execution modes.** The strategy is enforced in the shared run-creation

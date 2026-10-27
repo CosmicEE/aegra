@@ -283,6 +283,8 @@ async def test_queued_run_promoted_onto_hitl_pause_by_default_e2e() -> None:
         b.raise_for_status()
         rid_b = b.json()["run_id"]
         assert b.json()["status"] == "pending"  # internal 'queued'
+        # A must still be executing here, or B was admitted onto the pause instead of parked.
+        assert (await client.get(f"/threads/{tid}/runs/{a.json()['run_id']}")).json()["status"] == "running"
 
         assert await _wait_terminal(client, tid, a.json()["run_id"]) == "interrupted"
         # A's finalize promotes B onto the paused thread; B's fresh input discards the pause.
